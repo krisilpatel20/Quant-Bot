@@ -119,7 +119,7 @@ print(f"🚀 Quant Engine Initialized. Monitoring {len(WATCHLIST)} assets...")
 while True:
     print(f"\n🔄 Pulling market data at {time.strftime('%Y-%m-%d %H:%M:%S')}...")
     try:
-        raw_data = yf.download(WATCHLIST, period="5d", interval="15m", group_by="ticker", threads=True, show_errors=False)
+        raw_data = yf.download(WATCHLIST, period="5d", interval="15m", group_by="ticker", threads=True)
         
         for ticker in WATCHLIST:
             if len(WATCHLIST) > 1:

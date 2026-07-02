@@ -7,41 +7,63 @@ import yfinance as yf
 from datetime import datetime
 
 # ==========================================
-# CONFIGURATION
+# 1. CONFIGURATION
 # ==========================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 WATCHLIST = ["AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR", "AMZN", "APEI", "APLD", "APP", "APPF", "APPS", "ARQQ", "ASTS", "AVGO", "AXON", "AXP", "AZZ", "BABA", "BBAI", "BE", "BR", "BROS", "BTBT", "BULL", "CCL", "CDE", "CEG", "CELC", "CGNX", "CIFR", "CLSK", "CMG", "COIN", "CORT", "CPB", "CRCL", "CRM", "CRML", "CRWD", "CRWV", "CSGP", "DAL", "DELL", "EFX", "ELF", "ETN", "EXK", "FSLR", "FVRR", "GLXY", "GOOGL", "GTES", "HCC", "HIMS", "HOOD", "HPE", "HTZ", "HUT", "IHS", "INGR", "INTC", "INTU", "IONQ", "IREN", "IRON", "JKHY", "KKR", "LULU", "LUNR", "MARA", "META", "MOS", "MRK", "MRVL", "MSFT", "MSTR", "MTZ", "MU", "NBIS", "NEE", "NEGG", "NFLX", "NIO", "NNE", "NVAX", "NVDA", "NVTS", "ONDS", "OPEN", "ORCL", "OUST", "PGY", "PINS", "PLTR", "PNRG", "PRCH", "QBTS", "QCOM", "QS", "QUBT", "RBLX", "RDDT", "RDW", "RELX", "RELY", "RGTI", "RIOT", "RIVN", "RKLB", "ROK", "S", "SAP", "SBUX", "SCHW", "SEDG", "SG", "SHAK", "SHOP", "SMR", "SNDK", "SNOW", "SOFI", "SOUN", "SPCX", "SYM", "T", "TOST", "TPR", "TRI", "TSLA", "UA", "UAL", "UBER", "UFPT", "ULTA", "UNH", "UPST", "V", "VST", "WING", "WMT", "WULF", "XYZ"]
 
-last_signals = {}  # ticker -> "LONG" or "CASH", filled during initialization
-
-# ==========================================
-# MAIN KALMAN TRADE LOG PARAMETERS
-# (ported 1:1 from the Streamlit app's _get_current_main_kalman_params
-#  defaults, since this bot has no st.session_state to read sliders from)
-# ==========================================
-KALMAN_PARAMS = {
-    "fast_gain": 0.34,
-    "slow_gain": 0.055,
-    "polish_span": 3,
-    "atr_window": 14,
-    "rail_mult": 1.35,      # atr_mult
-    "buffer_pct": 0.0125,   # 1.25%
+DEFAULT_PARAMS = {
+    "buffer_pct": 0.0125,
     "confirm_bars": 3,
     "min_hold_bars": 5,
     "cooldown_bars": 3,
     "slope_confirm": True,
     "atr_safety": True,
+    "fast_gain": 0.34,
+    "slow_gain": 0.055,
+    "rail_mult": 1.35,
+    "polish_span": 3,
+    "atr_window": 14,
 }
 
+# Locked profiles from the Streamlit optimizer. Paste each ticker's saved
+# values here (from ~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json) after
+# you optimize it, then redeploy.
+TICKER_PROFILES = {
+    "CELH": {
+        "buffer_pct": 0.02,
+        "confirm_bars": 10,
+        "min_hold_bars": 55,
+        "cooldown_bars": 5,
+        "slope_confirm": True,
+        "atr_safety": True,
+        "fast_gain": 0.34,
+        "slow_gain": 0.055,
+        "rail_mult": 1.35,
+        "polish_span": 3,
+        "atr_window": 14,
+    },
+    # "CELC": { ... },  # add more optimized tickers here
+}
 
+positions = {ticker: "CASH" for ticker in WATCHLIST}
+
+
+def get_params_for_ticker(ticker):
+    p = dict(DEFAULT_PARAMS)
+    p.update(TICKER_PROFILES.get(str(ticker).upper(), {}))
+    return p
+
+
+# ==========================================
+# 2. ADAPTIVE KALMAN MATH
+# (ported exactly from the Streamlit app's institutional_adaptive_kalman_trend
+#  and institutional_trend_rail - volatility-scaled gain blend + stateful
+#  hysteresis rail that only flips when price breaks the PRIOR rail value)
+# ==========================================
 def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055, vol_window=20, polish_span=3):
-    """
-    Causal adaptive Kalman-style trend line.
-    Ported exactly from the Streamlit "Main Kalman" tab so the Render bot's
-    center line matches the visible chart/trade log.
-    """
     px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
     if px.empty:
         return np.array([])
@@ -61,11 +83,6 @@ def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055,
 
 
 def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_span=3, atr_window=14, atr_mult=1.35):
-    """
-    Directional trend rail. Ported exactly from the Streamlit "Main Kalman" tab
-    (stateful hysteresis: the rail only flips support<->resistance when price
-    breaks the PRIOR rail value, not from a static ema_fast > ema_slow check).
-    """
     px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
     if px.empty:
         return np.array([]), np.array([]), pd.Series(dtype=float)
@@ -93,7 +110,7 @@ def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_spa
     long_state.iloc[0] = state
 
     for i in range(1, len(px)):
-        p = float(px.iloc[i])
+        p_ = float(px.iloc[i])
         c = float(center.iloc[i])
         a = float(atr.iloc[i]) * float(atr_mult)
         sl = float(slope.iloc[i])
@@ -102,14 +119,14 @@ def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_spa
             candidate = c - a
             if sl >= 0:
                 candidate = max(candidate, float(rail.iloc[i - 1]) if np.isfinite(rail.iloc[i - 1]) else candidate)
-            if p < (float(rail.iloc[i - 1]) if np.isfinite(rail.iloc[i - 1]) else candidate):
+            if p_ < (float(rail.iloc[i - 1]) if np.isfinite(rail.iloc[i - 1]) else candidate):
                 state = False
                 candidate = c + a
         else:
             candidate = c + a
             if sl <= 0:
                 candidate = min(candidate, float(rail.iloc[i - 1]) if np.isfinite(rail.iloc[i - 1]) else candidate)
-            if p > (float(rail.iloc[i - 1]) if np.isfinite(rail.iloc[i - 1]) else candidate):
+            if p_ > (float(rail.iloc[i - 1]) if np.isfinite(rail.iloc[i - 1]) else candidate):
                 state = True
                 candidate = c - a
 
@@ -120,59 +137,47 @@ def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_spa
     return rail.values, center.values, long_state
 
 
-def get_signal(px, params=KALMAN_PARAMS):
-    """
-    Reproduces _build_main_kalman_trade_log_from_prices' position state machine
-    (entry/exit confirm bars, slope confirm, ATR safety exit, min-hold, cooldown)
-    and returns the CURRENT position status: "LONG" or "CASH".
-
-    This is deliberately NOT a bar-to-bar transition check. Comparing sig.iloc[-2]
-    vs sig.iloc[-1] only catches a flip if the poll lands on the exact bar it
-    happened - miss one poll (restart, rate limit, downtime) and that flip
-    silently slides into the middle of the window and never fires. Returning
-    the absolute current status instead lets the caller compare it against the
-    last KNOWN status (persisted across polls) so a status change is always
-    caught, no matter how many bars were missed in between.
-    """
+# ==========================================
+# 3. PATH-DEPENDENT TRADE-LOG STATE MACHINE
+# (ported exactly from _build_main_kalman_trade_log_from_prices: slope
+#  confirm, ATR safety exit, min-hold, cooldown, confirm-bar gating)
+# ==========================================
+def get_target_state(px, ticker):
     px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
     if len(px) < 80:
         return "CASH"
 
+    p = get_params_for_ticker(ticker)
+
     rail, center, long_state = institutional_trend_rail(
         px,
-        fast_gain=params["fast_gain"],
-        slow_gain=params["slow_gain"],
-        polish_span=params["polish_span"],
-        atr_window=params["atr_window"],
-        atr_mult=params["rail_mult"],
+        fast_gain=p["fast_gain"],
+        slow_gain=p["slow_gain"],
+        polish_span=p["polish_span"],
+        atr_window=p["atr_window"],
+        atr_mult=p["rail_mult"],
     )
     bt_trend = pd.Series(rail, index=px.index).ffill().bfill()
     trend_slope = bt_trend.diff().ewm(span=5, adjust=False).mean().fillna(0)
 
-    buffer_pct = params["buffer_pct"]
-    confirm_bars = params["confirm_bars"]
-    min_hold_bars = params["min_hold_bars"]
-    cooldown_bars = params["cooldown_bars"]
+    close_above = px > bt_trend * (1.0 + p["buffer_pct"])
+    close_below = px < bt_trend * (1.0 - p["buffer_pct"])
 
-    close_above = px > bt_trend * (1.0 + buffer_pct)
-    close_below = px < bt_trend * (1.0 - buffer_pct)
-
-    if params["slope_confirm"]:
+    if p["slope_confirm"]:
         entry_cond = close_above & (trend_slope >= 0)
         exit_cond = close_below & (trend_slope <= 0)
     else:
         entry_cond = close_above
         exit_cond = close_below
 
-    if params["atr_safety"]:
+    if p["atr_safety"]:
         atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
         safety_exit = px < (bt_trend - 1.25 * atr_proxy)
         exit_cond = exit_cond | safety_exit.fillna(False)
 
-    entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
-    exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
+    entry_ready = entry_cond.rolling(p["confirm_bars"], min_periods=p["confirm_bars"]).sum().eq(p["confirm_bars"]).fillna(False)
+    exit_ready = exit_cond.rolling(p["confirm_bars"], min_periods=p["confirm_bars"]).sum().eq(p["confirm_bars"]).fillna(False)
 
-    sig = pd.Series(0.0, index=px.index)
     in_pos = False
     bars_held = 0
     cooldown_left = 0
@@ -185,42 +190,70 @@ def get_signal(px, params=KALMAN_PARAMS):
             if cooldown_left <= 0 and bool(entry_ready.loc[dt]):
                 in_pos = True
                 bars_held = 0
-                sig.loc[dt] = 1.0
-            else:
-                sig.loc[dt] = 0.0
         else:
             bars_held += 1
-            if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
+            if bars_held >= p["min_hold_bars"] and bool(exit_ready.loc[dt]):
                 in_pos = False
-                cooldown_left = cooldown_bars
+                cooldown_left = p["cooldown_bars"]
                 bars_held = 0
-                sig.loc[dt] = 0.0
-            else:
-                sig.loc[dt] = 1.0
 
-    sig = sig.ffill().fillna(0).clip(0, 1)
+    return "LONG" if in_pos else "CASH"
 
-    if sig.empty:
-        return "CASH"
 
-    return "LONG" if sig.iloc[-1] >= 1.0 else "CASH"
+def fetch_60d_15m(ticker):
+    """Single-ticker fetch mirroring Streamlit's _main_monitor_fetch_15m:
+    60 days of 15m bars, tz normalized to Chicago, forming candle dropped."""
+    df = yf.download(ticker, period="60d", interval="15m", auto_adjust=True,
+                      progress=False, prepost=False, threads=False)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    close_col = "Close" if "Close" in df.columns else df.columns[-1]
+    px = pd.Series(df[close_col]).dropna().astype(float)
+    if len(px) < 80:
+        return None
+    try:
+        if px.index.tz is None:
+            px.index = px.index.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
+        px.index = px.index.tz_convert("America/Chicago").tz_localize(None)
+    except Exception:
+        pass
+    try:
+        now_ct = pd.Timestamp.now(tz="America/Chicago").tz_localize(None)
+        latest_close = pd.Timestamp(px.index[-1]) + pd.Timedelta(minutes=15)
+        if latest_close > now_ct and len(px) > 2:
+            px = px.iloc[:-1]
+    except Exception:
+        if len(px) > 2:
+            px = px.iloc[:-1]
+    return px.dropna()
+
+
+def send_alert(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                      json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"})
+    except Exception:
+        pass
 
 
 # ==========================================
-# INITIALIZATION
+# 4. INITIALIZATION
 # ==========================================
-print("🚀 Initializing state...")
-for i in range(0, len(WATCHLIST), 20):
-    batch = WATCHLIST[i:i + 20]
-    raw = yf.download(batch, period="1mo", interval="15m", group_by="ticker", threads=False)
-    for ticker in batch:
-        df = raw[ticker].dropna() if len(batch) > 1 else raw.dropna()
-        df.index = df.index.tz_convert('America/Chicago')
-        last_signals[ticker] = get_signal(df['Close'].tail(200))
-print("✅ Ready. Monitoring for changes...")
+print("🚀 Pinehurst Engine Initialized. Loading baseline positions...")
+for ticker in WATCHLIST:
+    px = fetch_60d_15m(ticker)
+    if px is None:
+        print(f"⚠️ {ticker}: not enough data, defaulting to CASH")
+        continue
+    positions[ticker] = get_target_state(px, ticker)
+print("✅ Initial state locked. Monitoring for absolute status changes...")
 
 # ==========================================
-# RUN LOOP
+# 5. RUN LOOP
 # ==========================================
 while True:
     now = datetime.now()
@@ -228,28 +261,30 @@ while True:
     time.sleep(max(sleep_time, 1))
 
     try:
-        for i in range(0, len(WATCHLIST), 20):
-            batch = WATCHLIST[i:i + 20]
-            raw = yf.download(batch, period="1mo", interval="15m", group_by="ticker", threads=False)
-            for ticker in batch:
-                df = raw[ticker].dropna() if len(batch) > 1 else raw.dropna()
-                df.index = df.index.tz_convert('America/Chicago')
-                curr_status = get_signal(df['Close'].tail(200))
-                prev_status = last_signals.get(ticker)
+        for ticker in WATCHLIST:
+            px = fetch_60d_15m(ticker)
+            if px is None:
+                continue
 
-                # Only act on tickers whose status actually flipped LONG<->CASH.
-                # Unchanged tickers (the vast majority every poll) are skipped
-                # entirely - no message, no state churn.
-                if prev_status is not None and curr_status != prev_status:
-                    action = "BUY" if curr_status == "LONG" else "SELL"
-                    msg = (f"{'🟢' if action=='BUY' else '🔴'} <b>{ticker} {action}</b>\n"
-                           f"Price: ${round(df['Close'].iloc[-1],2)}\n"
-                           f"Date: {df.index[-1].strftime('%Y-%m-%d')}\n"
-                           f"Time: {df.index[-1].strftime('%H:%M')}")
-                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                                  json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
+            target_state = get_target_state(px, ticker)
+            current_state = positions[ticker]
 
-                last_signals[ticker] = curr_status
-            time.sleep(10)
+            if current_state == "CASH" and target_state == "LONG":
+                msg = (f"🟢 <b>{ticker} BUY</b>\n"
+                       f"Price: ${round(px.iloc[-1], 2)}\n"
+                       f"Date: {px.index[-1].strftime('%Y-%m-%d')}\n"
+                       f"Time: {px.index[-1].strftime('%H:%M')}")
+                send_alert(msg)
+                positions[ticker] = "LONG"
+
+            elif current_state == "LONG" and target_state == "CASH":
+                msg = (f"🔴 <b>{ticker} SELL</b>\n"
+                       f"Price: ${round(px.iloc[-1], 2)}\n"
+                       f"Date: {px.index[-1].strftime('%Y-%m-%d')}\n"
+                       f"Time: {px.index[-1].strftime('%H:%M')}")
+                send_alert(msg)
+                positions[ticker] = "CASH"
+
+            time.sleep(0.5)
     except Exception as e:
         print(f"⚠️ Error: {e}")

@@ -25,7 +25,7 @@ WATCHLIST = [
     "UBER", "UFPT", "ULTA", "UNH", "UPST", "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
 
-# State Memory - initialized to None to avoid initial spam
+# State memory
 last_signals = {ticker: None for ticker in WATCHLIST}
 
 def send_alert(message):
@@ -59,11 +59,9 @@ def calculate_kalman_15m_signal(px):
     kf = KalmanFilterTrend()
     centerline = kf.filter(px)
     atr = px.diff().abs().ewm(span=14, adjust=False).mean()
-    # Rail logic adjusted for sensitivity
     rail_s = pd.Series(centerline - (atr * 1.1), index=px.index).ffill().bfill()
     trend_slope = centerline.diff().ewm(span=3, adjust=False).mean()
     state_s = trend_slope >= 0 
-    # Confirmation logic
     above = ((px > rail_s * 1.01) & state_s).astype(int).rolling(3).sum() >= 3
     below = ((px < rail_s * 0.99) & (~state_s)).astype(int).rolling(3).sum() >= 3
     if above.iloc[-1]: return "BUY"
@@ -71,22 +69,40 @@ def calculate_kalman_15m_signal(px):
     else: return "HOLD"
 
 print("🚀 Quant Engine Initialized...")
+
+# ==========================================
+# 2. BATCH PROCESSING LOOP
+# ==========================================
 while True:
     try:
-        raw_data = yf.download(WATCHLIST, period="5d", interval="15m", group_by="ticker", threads=True)
-        for ticker in WATCHLIST:
-            df = raw_data[ticker].dropna() if len(WATCHLIST) > 1 else raw_data.dropna()
-            if df.empty or len(df) < 20: continue
+        # Process in chunks of 20 to respect API rate limits
+        chunk_size = 20
+        for i in range(0, len(WATCHLIST), chunk_size):
+            batch = WATCHLIST[i:i + chunk_size]
+            print(f"Fetching batch {i//chunk_size + 1}...")
             
-            # Run signal logic
-            current_state = calculate_kalman_15m_signal(df['Close'].astype(float))
+            # Fetch data (no threads to ensure sequential stability)
+            raw_data = yf.download(batch, period="5d", interval="15m", group_by="ticker", threads=False)
             
-            # Send alert only on change
-            if last_signals[ticker] is not None and current_state != last_signals[ticker] and current_state in ["BUY", "SELL"]:
-                msg = f"{'🟢' if current_state == 'BUY' else '🔴'} <b>{ticker} Signal: {current_state}</b>\nPrice: ${round(df['Close'].iloc[-1], 2)}\nTime: {df.index[-1].strftime('%Y-%m-%d %H:%M')}"
-                send_alert(msg)
+            for ticker in batch:
+                df = raw_data[ticker].dropna() if len(batch) > 1 else raw_data.dropna()
+                if df.empty or len(df) < 20: continue
+                
+                current_state = calculate_kalman_15m_signal(df['Close'].astype(float))
+                
+                # Alert only on state flip
+                if last_signals[ticker] is not None and current_state != last_signals[ticker] and current_state in ["BUY", "SELL"]:
+                    msg = (f"{'🟢' if current_state == 'BUY' else '🔴'} <b>{ticker} Signal: {current_state}</b>\n"
+                           f"Price: ${round(df['Close'].iloc[-1], 2)}\n"
+                           f"Time: {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
+                    send_alert(msg)
+                
+                last_signals[ticker] = current_state
             
-            last_signals[ticker] = current_state
+            time.sleep(10) # 10-second rest between batches
             
-    except Exception as e: print(f"⚠️ Error: {e}")
-    time.sleep(900)
+    except Exception as e: 
+        print(f"⚠️ Error: {e}")
+        time.sleep(60)
+    
+    time.sleep(300) # Full cycle rest

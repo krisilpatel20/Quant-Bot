@@ -28,9 +28,7 @@ DEFAULT_PARAMS = {
     "atr_window": 14,
 }
 
-# Locked profiles from the Streamlit optimizer. Paste each ticker's saved
-# values here (from ~/.pinehurst_main_kalman_opt_params_V2_CLEAN.json) after
-# you optimize it, then redeploy.
+# Locked profiles from the Streamlit optimizer.
 TICKER_PROFILES = {
     "CELH": {
         "buffer_pct": 0.02,
@@ -45,23 +43,17 @@ TICKER_PROFILES = {
         "polish_span": 3,
         "atr_window": 14,
     },
-    # "CELC": { ... },  # add more optimized tickers here
 }
 
 positions = {ticker: "CASH" for ticker in WATCHLIST}
-
 
 def get_params_for_ticker(ticker):
     p = dict(DEFAULT_PARAMS)
     p.update(TICKER_PROFILES.get(str(ticker).upper(), {}))
     return p
 
-
 # ==========================================
 # 2. ADAPTIVE KALMAN MATH
-# (ported exactly from the Streamlit app's institutional_adaptive_kalman_trend
-#  and institutional_trend_rail - volatility-scaled gain blend + stateful
-#  hysteresis rail that only flips when price breaks the PRIOR rail value)
 # ==========================================
 def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055, vol_window=20, polish_span=3):
     px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
@@ -80,7 +72,6 @@ def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055,
     if int(polish_span) > 1:
         out = pd.Series(out, index=px.index).ewm(span=int(polish_span), adjust=False).mean().values
     return out
-
 
 def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_span=3, atr_window=14, atr_mult=1.35):
     px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
@@ -136,11 +127,8 @@ def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_spa
     rail = rail.ewm(span=2, adjust=False).mean()
     return rail.values, center.values, long_state
 
-
 # ==========================================
 # 3. PATH-DEPENDENT TRADE-LOG STATE MACHINE
-# (ported exactly from _build_main_kalman_trade_log_from_prices: slope
-#  confirm, ATR safety exit, min-hold, cooldown, confirm-bar gating)
 # ==========================================
 def get_target_state(px, ticker):
     px = pd.Series(px).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
@@ -199,10 +187,7 @@ def get_target_state(px, ticker):
 
     return "LONG" if in_pos else "CASH"
 
-
 def fetch_60d_15m(ticker):
-    """Single-ticker fetch mirroring Streamlit's _main_monitor_fetch_15m:
-    60 days of 15m bars, tz normalized to Chicago, forming candle dropped."""
     df = yf.download(ticker, period="60d", interval="15m", auto_adjust=True,
                       progress=False, prepost=False, threads=False)
     if df is None or df.empty:
@@ -229,7 +214,6 @@ def fetch_60d_15m(ticker):
             px = px.iloc[:-1]
     return px.dropna()
 
-
 def send_alert(message):
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -239,9 +223,8 @@ def send_alert(message):
     except Exception:
         pass
 
-
 # ==========================================
-# 4. INITIALIZATION
+# 4. INITIALIZATION & UTILITIES
 # ==========================================
 print("🚀 Pinehurst Engine Initialized. Loading baseline positions...")
 for ticker in WATCHLIST:
@@ -252,14 +235,76 @@ for ticker in WATCHLIST:
     positions[ticker] = get_target_state(px, ticker)
 print("✅ Initial state locked. Monitoring for absolute status changes...")
 
+def is_market_open_now():
+    now_ct = pd.Timestamp.now(tz="America/Chicago")
+    if now_ct.weekday() >= 5: 
+        return False
+    open_t = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+    close_t = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+    return open_t <= now_ct <= close_t
+
+def send_eod_summary():
+    today_str = pd.Timestamp.now(tz="America/Chicago").strftime("%Y-%m-%d")
+    long_list = sorted([t for t in WATCHLIST if positions.get(t) == "LONG"])
+    cash_list = sorted([t for t in WATCHLIST if positions.get(t) == "CASH"])
+
+    header = f"📋 <b>Status Summary — {today_str}</b>\n{len(long_list)} LONG / {len(cash_list)} CASH\n"
+    body_lines = [f"🟢 {t}: LONG" for t in long_list] + [f"⚪ {t}: CASH" for t in cash_list]
+
+    chunk = header
+    for line in body_lines:
+        if len(chunk) + len(line) + 1 > 3900:
+            send_alert(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        send_alert(chunk)
+
 # ==========================================
-# 5. RUN LOOP
+# 5. RUN LOOP WITH ACTIVE LISTENER
 # ==========================================
+cycle_count = 0
+eod_summary_sent_date = None
+last_update_id = None
+
 while True:
     now = datetime.now()
     sleep_time = (15 - (now.minute % 15)) * 60 - now.second
-    time.sleep(max(sleep_time, 1))
+    end_sleep = time.time() + max(sleep_time, 1)
 
+    # ACTIVE SLEEP: Listens for /status command while waiting for the next 15m mark
+    while time.time() < end_sleep:
+        if BOT_TOKEN:
+            try:
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?timeout=2"
+                if last_update_id:
+                    url += f"&offset={last_update_id}"
+                
+                resp = requests.get(url, timeout=5).json()
+                for result in resp.get("result", []):
+                    last_update_id = result["update_id"] + 1
+                    text = result.get("message", {}).get("text", "").strip()
+                    
+                    if text == "/status":
+                        print(f"📲 On-demand status requested @ {pd.Timestamp.now(tz='America/Chicago').strftime('%I:%M %p CT')}")
+                        send_eod_summary()
+            except Exception:
+                pass
+        time.sleep(2)
+
+    if not is_market_open_now():
+        now_ct = pd.Timestamp.now(tz="America/Chicago")
+        print(f"💤 {now_ct.strftime('%Y-%m-%d %I:%M %p CT')} - market closed, skipping this cycle")
+
+        if now_ct.weekday() < 5 and now_ct.time() >= pd.Timestamp("15:00").time() and eod_summary_sent_date != now_ct.date():
+            print(f"📋 Sending end-of-day summary for {now_ct.strftime('%Y-%m-%d')}...")
+            send_eod_summary()
+            eod_summary_sent_date = now_ct.date()
+
+        continue
+
+    cycle_count += 1
+    changed = 0
     try:
         for ticker in WATCHLIST:
             px = fetch_60d_15m(ticker)
@@ -273,18 +318,23 @@ while True:
                 msg = (f"🟢 <b>{ticker} BUY</b>\n"
                        f"Price: ${round(px.iloc[-1], 2)}\n"
                        f"Date: {px.index[-1].strftime('%Y-%m-%d')}\n"
-                       f"Time: {px.index[-1].strftime('%H:%M')}")
+                       f"Time: {px.index[-1].strftime('%H:%M')} CT")
                 send_alert(msg)
                 positions[ticker] = "LONG"
+                changed += 1
 
             elif current_state == "LONG" and target_state == "CASH":
                 msg = (f"🔴 <b>{ticker} SELL</b>\n"
                        f"Price: ${round(px.iloc[-1], 2)}\n"
                        f"Date: {px.index[-1].strftime('%Y-%m-%d')}\n"
-                       f"Time: {px.index[-1].strftime('%H:%M')}")
+                       f"Time: {px.index[-1].strftime('%H:%M')} CT")
                 send_alert(msg)
                 positions[ticker] = "CASH"
+                changed += 1
 
             time.sleep(0.5)
+
+        print(f"🔄 Cycle {cycle_count} complete @ {pd.Timestamp.now(tz='America/Chicago').strftime('%I:%M %p CT')} "
+              f"- {len(WATCHLIST)} tickers checked, {changed} status change(s)")
     except Exception as e:
         print(f"⚠️ Error: {e}")

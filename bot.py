@@ -4,7 +4,6 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime
 
 # ==========================================
 # 1. SECURE CONFIGURATION
@@ -15,7 +14,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 WATCHLIST = [
     "AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR", "AMZN", "APEI", 
     "APLD", "APP", "APPF", "APPS", "ARQQ", "ASTS", "AVGO", "AXON", "AXP", "AZZ", "BABA", "BBAI", "BE", "BR", 
-    "BRK.B", "BROS", "BTBT", "BULL", "CCL", "CDE", "CEG", "CELC", "CGNX", "CIFR", "CLSK", "CMG", "COIN", "CORT", 
+    "BROS", "BTBT", "BULL", "CCL", "CDE", "CEG", "CELC", "CGNX", "CIFR", "CLSK", "CMG", "COIN", "CORT", 
     "CPB", "CRCL", "CRM", "CRML", "CRWD", "CRWV", "CSGP", "DAL", "DELL", "EFX", "ELF", "ETN", "EXK", "FSLR", 
     "FVRR", "GLXY", "GOOGL", "GTES", "HCC", "HIMS", "HOOD", "HPE", "HTZ", "HUT", "IHS", "INGR", "INTC", "INTU", 
     "IONQ", "IREN", "IRON", "JKHY", "KKR", "LULU", "LUNR", "MARA", "META", "MOS", "MRK", "MRVL", "MSFT", "MSTR", 
@@ -26,6 +25,7 @@ WATCHLIST = [
     "UBER", "UFPT", "ULTA", "UNH", "UPST", "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
 
+# State memory
 last_signals = {ticker: None for ticker in WATCHLIST}
 
 def send_alert(message):
@@ -35,17 +35,6 @@ def send_alert(message):
         requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"})
     except Exception as e:
         print(f"Alert Error: {e}")
-
-def wait_for_next_15m():
-    now = datetime.now()
-    next_minute = (now.minute // 15 + 1) * 15
-    if next_minute >= 60:
-        next_time = now.replace(hour=now.hour + 1, minute=0, second=5, microsecond=0)
-    else:
-        next_time = now.replace(minute=next_minute, second=5, microsecond=0)
-    sleep_seconds = (next_time - now).total_seconds()
-    print(f"💤 Sleeping for {int(sleep_seconds)}s until next market clock bar...")
-    time.sleep(sleep_seconds)
 
 class KalmanFilterTrend:
     def __init__(self, process_noise=1e-3, measurement_noise=5e-2):
@@ -80,23 +69,40 @@ def calculate_kalman_15m_signal(px):
     else: return "HOLD"
 
 print("🚀 Quant Engine Initialized...")
+
+# ==========================================
+# 2. BATCH PROCESSING LOOP
+# ==========================================
 while True:
-    wait_for_next_15m()
     try:
+        # Process in chunks of 20 to respect API rate limits
         chunk_size = 20
         for i in range(0, len(WATCHLIST), chunk_size):
             batch = WATCHLIST[i:i + chunk_size]
             print(f"Fetching batch {i//chunk_size + 1}...")
+            
+            # Fetch data (no threads to ensure sequential stability)
             raw_data = yf.download(batch, period="5d", interval="15m", group_by="ticker", threads=False)
+            
             for ticker in batch:
                 df = raw_data[ticker].dropna() if len(batch) > 1 else raw_data.dropna()
                 if df.empty or len(df) < 20: continue
+                
                 current_state = calculate_kalman_15m_signal(df['Close'].astype(float))
+                
+                # Alert only on state flip
                 if last_signals[ticker] is not None and current_state != last_signals[ticker] and current_state in ["BUY", "SELL"]:
                     msg = (f"{'🟢' if current_state == 'BUY' else '🔴'} <b>{ticker} Signal: {current_state}</b>\n"
-                           f"Price: ${round(df['Close'].iloc[-1], 2)}\nTime: {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
+                           f"Price: ${round(df['Close'].iloc[-1], 2)}\n"
+                           f"Time: {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
                     send_alert(msg)
+                
                 last_signals[ticker] = current_state
-            time.sleep(10)
+            
+            time.sleep(10) # 10-second rest between batches
+            
     except Exception as e: 
         print(f"⚠️ Error: {e}")
+        time.sleep(60)
+    
+    time.sleep(300) # Full cycle rest

@@ -12,6 +12,7 @@ from datetime import datetime
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
+# BRK.B removed from this list
 WATCHLIST = [
     "AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR", "AMZN", "APEI", 
     "APLD", "APP", "APPF", "APPS", "ARQQ", "ASTS", "AVGO", "AXON", "AXP", "AZZ", "BABA", "BBAI", "BE", "BR", 
@@ -66,7 +67,7 @@ def calculate_kalman_15m_signal(px):
     elif below.iloc[-1]: return "SELL"
     return "HOLD"
 
-print("🚀 Quant Engine Initialized...")
+print("🚀 Quant Engine Initialized (Central Time)...")
 while True:
     wait_for_next_15m()
     try:
@@ -75,6 +76,8 @@ while True:
             raw = yf.download(batch, period="5d", interval="15m", group_by="ticker", threads=False)
             for ticker in batch:
                 df = raw[ticker].dropna() if len(batch) > 1 else raw.dropna()
+                # ENFORCE CENTRAL TIME
+                df.index = df.index.tz_convert('America/Chicago')
                 if len(df) < 20: continue
                 curr = calculate_kalman_15m_signal(df['Close'].astype(float))
                 if last_signals[ticker] and curr != last_signals[ticker] and curr in ["BUY", "SELL"]:

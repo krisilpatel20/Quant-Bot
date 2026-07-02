@@ -78,7 +78,11 @@ while True:
                 if len(df) < 20: continue
                 curr = calculate_kalman_15m_signal(df['Close'].astype(float))
                 if last_signals[ticker] and curr != last_signals[ticker] and curr in ["BUY", "SELL"]:
-                    send_alert(f"{'🟢' if curr=='BUY' else '🔴'} <b>{ticker} {curr}</b>\nPrice: ${round(df['Close'].iloc[-1],2)}\nTime: {df.index[-1].strftime('%H:%M')}")
+                    msg = (f"{'🟢' if curr=='BUY' else '🔴'} <b>{ticker} {curr}</b>\n"
+                           f"Price: ${round(df['Close'].iloc[-1],2)}\n"
+                           f"Date: {df.index[-1].strftime('%Y-%m-%d')}\n"
+                           f"Time: {df.index[-1].strftime('%H:%M')}")
+                    send_alert(msg)
                 last_signals[ticker] = curr
             time.sleep(10)
     except Exception as e: print(f"⚠️ Error: {e}")

@@ -25,21 +25,27 @@ WATCHLIST = [
     "UBER", "UFPT", "ULTA", "UNH", "UPST", "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
 
+# State Memory - initialized to None to avoid initial spam
 last_signals = {ticker: None for ticker in WATCHLIST}
 
 def send_alert(message):
     if not BOT_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"})
+    try:
+        requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"})
+    except Exception as e:
+        print(f"Alert Error: {e}")
 
 class KalmanFilterTrend:
-    def __init__(self, process_noise=1e-3, measurement_noise=1e-2):
+    def __init__(self, process_noise=1e-3, measurement_noise=5e-2):
         self.Q, self.R = process_noise, measurement_noise
     def filter(self, data):
         data_vals = data.values
         n = len(data_vals)
-        state_mean = np.zeros(n); state_cov = np.zeros(n)
-        state_mean[0] = data_vals[0]; state_cov[0] = 1.0
+        state_mean = np.zeros(n)
+        state_cov = np.zeros(n)
+        state_mean[0] = data_vals[0]
+        state_cov[0] = 1.0
         for t in range(1, n):
             pred_mean = state_mean[t-1]
             pred_cov = state_cov[t-1] + self.Q
@@ -50,28 +56,37 @@ class KalmanFilterTrend:
 
 def calculate_kalman_15m_signal(px):
     if len(px) < 20: return "HOLD"
-    kf = KalmanFilterTrend(process_noise=1e-3, measurement_noise=1e-2)
+    kf = KalmanFilterTrend()
     centerline = kf.filter(px)
     atr = px.diff().abs().ewm(span=14, adjust=False).mean()
-    rail_s = pd.Series(centerline - (atr * 1.35), index=px.index).ffill().bfill()
+    # Rail logic adjusted for sensitivity
+    rail_s = pd.Series(centerline - (atr * 1.1), index=px.index).ffill().bfill()
     trend_slope = centerline.diff().ewm(span=3, adjust=False).mean()
     state_s = trend_slope >= 0 
-    above = ((px > rail_s * 1.0125) & state_s).astype(int).rolling(3).sum() >= 3
-    below = ((px < rail_s * 0.9875) | (~state_s)).astype(int).rolling(3).sum() >= 3
+    # Confirmation logic
+    above = ((px > rail_s * 1.01) & state_s).astype(int).rolling(3).sum() >= 3
+    below = ((px < rail_s * 0.99) & (~state_s)).astype(int).rolling(3).sum() >= 3
     if above.iloc[-1]: return "BUY"
     elif below.iloc[-1]: return "SELL"
     else: return "HOLD"
 
-print(f"🚀 Quant Engine Initialized...")
+print("🚀 Quant Engine Initialized...")
 while True:
     try:
         raw_data = yf.download(WATCHLIST, period="5d", interval="15m", group_by="ticker", threads=True)
         for ticker in WATCHLIST:
             df = raw_data[ticker].dropna() if len(WATCHLIST) > 1 else raw_data.dropna()
             if df.empty or len(df) < 20: continue
+            
+            # Run signal logic
             current_state = calculate_kalman_15m_signal(df['Close'].astype(float))
+            
+            # Send alert only on change
             if last_signals[ticker] is not None and current_state != last_signals[ticker] and current_state in ["BUY", "SELL"]:
-                send_alert(f"{'🟢' if current_state == 'BUY' else '🔴'} <b>{ticker} Signal: {current_state}</b>\\nPrice: ${round(df['Close'].iloc[-1], 2)}")
+                msg = f"{'🟢' if current_state == 'BUY' else '🔴'} <b>{ticker} Signal: {current_state}</b>\nPrice: ${round(df['Close'].iloc[-1], 2)}\nTime: {df.index[-1].strftime('%Y-%m-%d %H:%M')}"
+                send_alert(msg)
+            
             last_signals[ticker] = current_state
+            
     except Exception as e: print(f"⚠️ Error: {e}")
     time.sleep(900)

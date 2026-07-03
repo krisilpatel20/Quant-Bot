@@ -73,7 +73,7 @@ STREAMLIT_OPEN_TICKERS = {
 # CRITICAL SAFETY: when true, Render will NOT convert UNKNOWN tickers into CASH/LONG
 # from a fresh historical recompute. It waits for /sync or STREAMLIT_OPEN_TICKERS first.
 # This prevents the exact PLTR issue: old=UNKNOWN raw_state=CASH raw_alert=SELL.
-REQUIRE_STREAMLIT_SYNC = os.environ.get("REQUIRE_STREAMLIT_SYNC", "true").lower() == "true"
+REQUIRE_STREAMLIT_SYNC = os.environ.get("REQUIRE_STREAMLIT_SYNC", "false").lower() == "true"
 ledger_synced = False
 
 # Persistent non-repaint lock, same idea as Streamlit's .pinehurst_main_kalman_signal_lock file.
@@ -96,9 +96,9 @@ WATCHLIST = [
     "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
 
-STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v9.json")
-SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v9.json")
-UPDATE_OFFSET_FILE = os.environ.get("UPDATE_OFFSET_FILE", "kalman_render_update_offset_v9.json")
+STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v10.json")
+SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v10.json")
+UPDATE_OFFSET_FILE = os.environ.get("UPDATE_OFFSET_FILE", "kalman_render_update_offset_v10.json")
 positions = {ticker: "UNKNOWN" for ticker in WATCHLIST}
 last_alert_bar = {}
 last_checked = {}
@@ -110,6 +110,8 @@ full_scans_completed = 0
 rescan_requested = False
 last_update_id = None
 sync_wait_notice_sent = False
+if not REQUIRE_STREAMLIT_SYNC:
+    ledger_synced = True
 
 # ============================================================
 # TELEGRAM HELPERS
@@ -176,7 +178,7 @@ def load_state():
                 seed_protected_until_bar.update(saved_seed_bars)
             if isinstance(saved_streamlit_open, list):
                 STREAMLIT_OPEN_TICKERS.update([str(x).upper() for x in saved_streamlit_open])
-            ledger_synced = bool(data.get("ledger_synced", False)) or bool(STREAMLIT_OPEN_TICKERS)
+            ledger_synced = bool(data.get("ledger_synced", False)) or bool(STREAMLIT_OPEN_TICKERS) or (not REQUIRE_STREAMLIT_SYNC)
             # Seed known-open Streamlit positions at worker startup.
             # This is a ledger seed, not a fresh recompute. It avoids false startup sells.
             for t in STREAMLIT_OPEN_TICKERS:
@@ -870,13 +872,12 @@ def scan_once():
 if __name__ == "__main__":
     load_state()
     _load_update_offset()
-    print("🚀 Pinehurst Main Kalman Render Engine Active — Ledger Mode")
+    print("🚀 Pinehurst Main Kalman Render Engine Active — Auto Status Mode")
     print(f"Interval={INTERVAL} Period={PERIOD} Watchlist={len(WATCHLIST)}")
     print("Params:", PARAMS)
     print("Streamlit seed opens:", sorted(STREAMLIT_OPEN_TICKERS))
-    print("Sync command: /sync PLTR,AAPL,NVDA  # paste exact Streamlit open list")
     print(f"Require Streamlit sync={REQUIRE_STREAMLIT_SYNC} ledger_synced={ledger_synced}")
-    send_telegram(f"🚀 <b>Pinehurst Main Kalman Render Engine Active — Ledger Mode</b>\nUse /sync with your exact Streamlit OPEN list. After sync, Render will not overwrite open trades from historical recompute; it only changes state on latest-bar BUY/SELL transitions.")
+    send_telegram(f"🚀 <b>Pinehurst Main Kalman Render Engine Active — Auto Status Mode</b>\nScanning watchlist now using Streamlit Main Kalman trade-log logic: 60d / 15m / auto_adjust=True / prepost=False. Use /status after first full scan.")
 
     while True:
         scan_once()

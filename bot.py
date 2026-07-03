@@ -63,6 +63,17 @@ ALERTS_AFTER_BASELINE_ONLY = os.environ.get("ALERTS_AFTER_BASELINE_ONLY", "true"
 SELL_CONFIRM_SCANS = int(os.environ.get("SELL_CONFIRM_SCANS", "1"))
 pending_sell_counts = {}
 
+# Optional live seed from your Streamlit visible Main Kalman open positions.
+# Example: STREAMLIT_OPEN_TICKERS=PLTR,AAPL,NVDA
+# This prevents Render from rewriting an already-open Streamlit trade to CASH on startup.
+STREAMLIT_OPEN_TICKERS = {
+    t.strip().upper() for t in os.environ.get("STREAMLIT_OPEN_TICKERS", "").split(",") if t.strip()
+}
+
+# Persistent non-repaint lock, same idea as Streamlit's .pinehurst_main_kalman_signal_lock file.
+SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v4.json")
+seed_protected_until_bar = {}
+
 
 WATCHLIST = [
     "AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR",
@@ -80,7 +91,7 @@ WATCHLIST = [
     "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
 
-STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state.json")
+STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v4.json")
 positions = {ticker: "UNKNOWN" for ticker in WATCHLIST}
 last_alert_bar = {}
 last_checked = {}
@@ -109,7 +120,7 @@ def send_telegram(text: str):
 
 
 def load_state():
-    global positions, last_alert_bar
+    global positions, last_alert_bar, seed_protected_until_bar
     try:
         if os.path.exists(STATE_FILE):
             data = json.load(open(STATE_FILE, "r"))
@@ -117,6 +128,8 @@ def load_state():
             saved_alerts = data.get("last_alert_bar", {})
             saved_checked = data.get("last_checked", {})
             saved_errors = data.get("last_error", {})
+            saved_seed_bars = data.get("seed_protected_until_bar", {})
+            saved_streamlit_open = data.get("streamlit_open_tickers", [])
             for t in WATCHLIST:
                 if saved_pos.get(t) in ("LONG", "CASH", "UNKNOWN"):
                     positions[t] = saved_pos[t]
@@ -126,13 +139,22 @@ def load_state():
                 last_checked.update(saved_checked)
             if isinstance(saved_errors, dict):
                 last_error.update(saved_errors)
+            if isinstance(saved_seed_bars, dict):
+                seed_protected_until_bar.update(saved_seed_bars)
+            if isinstance(saved_streamlit_open, list):
+                STREAMLIT_OPEN_TICKERS.update([str(x).upper() for x in saved_streamlit_open])
+            # Seed known-open Streamlit positions at worker startup.
+            # This is a ledger seed, not a fresh recompute. It avoids false startup sells.
+            for t in STREAMLIT_OPEN_TICKERS:
+                if t in positions and positions.get(t) in ("UNKNOWN", "CASH"):
+                    positions[t] = "LONG"
     except Exception as e:
         print(f"State load error: {e}")
 
 
 def save_state():
     try:
-        json.dump({"positions": positions, "last_alert_bar": last_alert_bar, "last_checked": last_checked, "last_error": last_error, "full_scans_completed": full_scans_completed}, open(STATE_FILE, "w"), indent=2)
+        json.dump({"positions": positions, "last_alert_bar": last_alert_bar, "last_checked": last_checked, "last_error": last_error, "full_scans_completed": full_scans_completed, "seed_protected_until_bar": seed_protected_until_bar, "streamlit_open_tickers": sorted(STREAMLIT_OPEN_TICKERS)}, open(STATE_FILE, "w"), indent=2)
     except Exception as e:
         print(f"State save error: {e}")
 
@@ -144,7 +166,7 @@ def fmt_ct_now():
     return ct_now().strftime("%Y-%m-%d %I:%M %p CT")
 
 def handle_telegram_commands():
-    global last_update_id, rescan_requested
+    global last_update_id, rescan_requested, STREAMLIT_OPEN_TICKERS
     if not BOT_TOKEN:
         return
     try:
@@ -169,6 +191,7 @@ def handle_telegram_commands():
                     f"📋 <b>Main Kalman Status — {fmt_ct_now()}</b>\n"
                     f"Interval: <b>{INTERVAL}</b> | Period: <b>{PERIOD}</b>\n"
                     f"Verified: <b>{verified}/{len(WATCHLIST)}</b> | Full scans: <b>{full_scans_completed}</b>{header_note}\n"
+                    f"Streamlit seed opens: <b>{len(STREAMLIT_OPEN_TICKERS)}</b> | Signal lock: <b>ON</b>\n"
                     f"{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN / {len(failed)} DATA ERRORS\n\n"
                     + ("<b>LONG</b>\n" + "".join([f"🟢 {t}\n" for t in longs]) if longs else "<b>LONG</b>\nNone\n")
                     + "\n<b>CASH</b>\n"
@@ -186,8 +209,40 @@ def handle_telegram_commands():
             elif text == "/rescan":
                 rescan_requested = True
                 send_telegram("🔄 <b>Rescan requested.</b> I will refresh the full watchlist on this worker loop.")
+            elif text.startswith("/why ") or text.startswith("/debug "):
+                parts = text.split()
+                if len(parts) >= 2:
+                    send_telegram(debug_ticker(parts[1].upper())[:3900])
+                else:
+                    send_telegram("Use /why TICKER, example: /why PLTR")
+
+            elif text.startswith("/seed "):
+                raw = text.replace("/seed", "", 1).strip().upper()
+                syms = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+                added = []
+                for t in syms:
+                    if t in WATCHLIST:
+                        STREAMLIT_OPEN_TICKERS.add(t)
+                        positions[t] = "LONG"
+                        seed_protected_until_bar.pop(t, None)
+                        added.append(t)
+                save_state()
+                send_telegram("✅ <b>Seeded Streamlit-open tickers as LONG:</b> " + (", ".join(sorted(added)) if added else "None matched watchlist"))
+            elif text.startswith("/unseed "):
+                raw = text.replace("/unseed", "", 1).strip().upper()
+                syms = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+                removed = []
+                for t in syms:
+                    if t in STREAMLIT_OPEN_TICKERS:
+                        STREAMLIT_OPEN_TICKERS.discard(t)
+                        seed_protected_until_bar.pop(t, None)
+                        removed.append(t)
+                save_state()
+                send_telegram("🧹 <b>Removed Streamlit seed tickers:</b> " + (", ".join(sorted(removed)) if removed else "None"))
             elif text == "/params":
                 msg = "⚙️ <b>Main Kalman Params</b>\n" + "\n".join([f"{k}: <b>{v}</b>" for k, v in PARAMS.items()])
+                msg += f"\nSTREAMLIT_OPEN_TICKERS: <b>{','.join(sorted(STREAMLIT_OPEN_TICKERS)) if STREAMLIT_OPEN_TICKERS else 'NONE'}</b>"
+                msg += f"\nPER_TICKER_PARAMS loaded: <b>{len(PER_TICKER_PARAMS)}</b>"
                 send_telegram(msg)
     except Exception as e:
         print(f"Telegram command error: {e}")
@@ -197,7 +252,7 @@ def handle_telegram_commands():
 # ============================================================
 def fetch_completed_bars(ticker: str):
     try:
-        df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False, threads=False)
+        df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True, prepost=False, threads=False)
         if df is None or df.empty:
             return None
 
@@ -337,6 +392,62 @@ def params_for_ticker(ticker: str):
     return p
 
 
+
+def load_signal_lock():
+    try:
+        if os.path.exists(SIGNAL_LOCK_FILE):
+            data = json.load(open(SIGNAL_LOCK_FILE, "r"))
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"Signal lock load error: {e}")
+    return {}
+
+
+def save_signal_lock(store):
+    try:
+        json.dump(store, open(SIGNAL_LOCK_FILE, "w"), indent=2)
+    except Exception as e:
+        print(f"Signal lock save error: {e}")
+
+
+def apply_render_signal_lock(ticker: str, sig: pd.Series):
+    """
+    Same purpose as Streamlit's _apply_signal_lock():
+    already-seen bar timestamps are frozen and cannot be rewritten by a later 60d recompute.
+    New completed bars are appended to the lock.
+    """
+    try:
+        if sig is None or len(sig) == 0:
+            return sig
+        key = f"{str(ticker).upper()}|{INTERVAL}"
+        store = load_signal_lock()
+        locked = dict(store.get(key, {})) if isinstance(store.get(key), dict) else {}
+        out = sig.copy()
+        changed = False
+        for dt in out.index:
+            dtk = pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M:%S")
+            if dtk in locked:
+                try:
+                    out.loc[dt] = float(locked[dtk])
+                except Exception:
+                    pass
+            else:
+                try:
+                    locked[dtk] = float(out.loc[dt])
+                    changed = True
+                except Exception:
+                    pass
+        if changed:
+            if len(locked) > 6000:
+                for old_key in sorted(locked.keys())[: len(locked) - 6000]:
+                    locked.pop(old_key, None)
+            store[key] = locked
+            save_signal_lock(store)
+        return out
+    except Exception as e:
+        print(f"Signal lock apply error {ticker}: {e}")
+        return sig
+
 def build_main_kalman_signal(px: pd.Series, ticker: str = ""):
     pms = params_for_ticker(ticker)
     rail, center, long_state = institutional_trend_rail(
@@ -400,8 +511,55 @@ def build_main_kalman_signal(px: pd.Series, ticker: str = ""):
                 sig.loc[dt] = 1.0
 
     sig = sig.ffill().fillna(0.0).clip(0.0, 1.0)
+    sig = apply_render_signal_lock(ticker, sig)
     return sig, rail_s
 
+
+
+def run_streamlit_trade_log_status(px: pd.Series, sig: pd.Series, initial_capital: float = 10000.0):
+    """Minimal port of Streamlit BacktestEngine.run_strategy trade-status accounting."""
+    common_idx = px.index.intersection(sig.index)
+    prices = pd.Series(px.loc[common_idx]).replace([np.inf, -np.inf], np.nan).dropna()
+    signals = pd.Series(sig).reindex(prices.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
+    if len(prices) == 0:
+        return "CASH", None
+
+    position = 0
+    entry_price = None
+    entry_date = None
+    last_trade = None
+
+    for dt in prices.index:
+        price = float(prices.loc[dt])
+        desired = float(signals.loc[dt])
+        if position == 0 and desired > 0:
+            position = 1
+            entry_price = price
+            entry_date = dt
+        elif position == 1 and desired == 0:
+            last_trade = {
+                "Status": "Closed",
+                "Entry Date": entry_date,
+                "Exit Date": dt,
+                "Buy Price": entry_price,
+                "Sell Price": price,
+                "PnL (%)": ((price - entry_price) / entry_price * 100.0) if entry_price else 0.0,
+            }
+            position = 0
+            entry_price = None
+            entry_date = None
+
+    if position == 1:
+        last_trade = {
+            "Status": "Open",
+            "Entry Date": entry_date,
+            "Exit Date": "Open",
+            "Buy Price": entry_price,
+            "Sell Price": float(prices.iloc[-1]),
+            "PnL (%)": ((float(prices.iloc[-1]) - entry_price) / entry_price * 100.0) if entry_price else 0.0,
+        }
+        return "LONG", last_trade
+    return "CASH", last_trade
 
 def latest_kalman_state(ticker: str):
     px = fetch_completed_bars(ticker)
@@ -412,7 +570,8 @@ def latest_kalman_state(ticker: str):
     latest_sig = int(sig.iloc[-1])
     prev_sig = int(sig.iloc[-2]) if len(sig) >= 2 else latest_sig
 
-    position = "LONG" if latest_sig == 1 else "CASH"
+    # Match Streamlit: status comes from the trade log/accounting, not only raw final signal.
+    position, last_trade = run_streamlit_trade_log_status(px, sig)
     alert = "BUY" if latest_sig == 1 and prev_sig == 0 else "SELL" if latest_sig == 0 and prev_sig == 1 else "NO NEW ALERT"
 
     last_start = pd.Timestamp(px.index[-1])
@@ -427,6 +586,7 @@ def latest_kalman_state(ticker: str):
         "rail": float(rail_s.iloc[-1]),
         "bar_start_ct": last_start,
         "candle_close_ct": candle_close,
+        "last_trade": last_trade,
     }
 
 
@@ -466,6 +626,7 @@ def debug_ticker(ticker: str):
             f"entry_ready: {bool(entry_ready.iloc[i])} | exit_ready: {bool(exit_ready.iloc[i])}",
             f"trend_slope: {float(trend_slope.iloc[i]):.5f}",
             f"params: buffer={pms['buffer_pct']}, confirm={pms['confirm_bars']}, hold={pms['min_hold_bars']}, cool={pms['cooldown_bars']}, rail_mult={pms['rail_mult']}",
+            "Data fetch: auto_adjust=True, prepost=False, period=60d, interval=15m",
         ]
         if ticker in PER_TICKER_PARAMS:
             lines.append("Per-ticker override: YES")
@@ -496,7 +657,20 @@ def scan_once():
                 continue
 
             old_state = positions.get(ticker, "UNKNOWN")
-            new_state = info["position"]
+            raw_new_state = info["position"]
+            new_state = raw_new_state
+
+            # If user seeded Streamlit-visible open tickers, do NOT let Render rewrite
+            # that old open trade to CASH on startup or on repeated scans of the same candle.
+            # Once a newer completed candle appears, Render may close it normally.
+            if ticker in STREAMLIT_OPEN_TICKERS:
+                current_bar_key = info["candle_close_ct"].strftime("%Y-%m-%d %H:%M:%S")
+                if ticker not in seed_protected_until_bar and raw_new_state == "CASH" and old_state == "LONG":
+                    seed_protected_until_bar[ticker] = current_bar_key
+                    new_state = "LONG"
+                elif raw_new_state == "CASH" and old_state == "LONG" and seed_protected_until_bar.get(ticker) == current_bar_key:
+                    new_state = "LONG"
+
             last_checked[ticker] = info["candle_close_ct"].strftime("%Y-%m-%d %I:%M %p CT")
             last_error.pop(ticker, None)
 
@@ -538,7 +712,7 @@ def scan_once():
                 send_telegram(msg)
                 print(f"📊 {ticker}: {old_state} -> {new_state} | {transition_alert} | {info['price']:.2f}")
             else:
-                print(f"{ticker}: {new_state} | {info['price']:.2f} | old={old_state} raw={info['alert']}")
+                print(f"{ticker}: {new_state} | {info['price']:.2f} | old={old_state} raw_state={raw_new_state} raw_alert={info['alert']}")
 
             save_state()
             time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
@@ -559,6 +733,7 @@ if __name__ == "__main__":
     print("🚀 Pinehurst Main Kalman Render Engine Active")
     print(f"Interval={INTERVAL} Period={PERIOD} Watchlist={len(WATCHLIST)}")
     print("Params:", PARAMS)
+    print("Streamlit seed opens:", sorted(STREAMLIT_OPEN_TICKERS))
     send_telegram(f"🚀 <b>Pinehurst Main Kalman Render Engine Active</b>\nStarting baseline scan. Use /status after full scan count is at least 1.")
 
     while True:

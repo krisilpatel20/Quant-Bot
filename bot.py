@@ -71,7 +71,7 @@ STREAMLIT_OPEN_TICKERS = {
 }
 
 # Persistent non-repaint lock, same idea as Streamlit's .pinehurst_main_kalman_signal_lock file.
-SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v4.json")
+SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v6.json")
 seed_protected_until_bar = {}
 
 
@@ -91,7 +91,7 @@ WATCHLIST = [
     "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
 
-STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v4.json")
+STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v6.json")
 positions = {ticker: "UNKNOWN" for ticker in WATCHLIST}
 last_alert_bar = {}
 last_checked = {}
@@ -165,6 +165,26 @@ def ct_now():
 def fmt_ct_now():
     return ct_now().strftime("%Y-%m-%d %I:%M %p CT")
 
+def parse_ticker_csv(raw: str):
+    raw = str(raw or "").upper().replace(";", ",").replace("\n", ",")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+def sync_streamlit_open_ledger(open_tickers):
+    """
+    Hard-sync Render's position ledger to the Streamlit Main Kalman open list.
+    This is needed because Render is a separate worker and cannot read Streamlit's session/trade-log state.
+    """
+    global STREAMLIT_OPEN_TICKERS
+    clean = {str(t).upper().strip() for t in open_tickers if str(t).upper().strip() in WATCHLIST}
+    STREAMLIT_OPEN_TICKERS.clear()
+    STREAMLIT_OPEN_TICKERS.update(clean)
+    for t in WATCHLIST:
+        positions[t] = "LONG" if t in clean else "CASH"
+        pending_sell_counts.pop(t, None)
+        seed_protected_until_bar.pop(t, None)
+    save_state()
+    return sorted(clean)
+
 def handle_telegram_commands():
     global last_update_id, rescan_requested, STREAMLIT_OPEN_TICKERS
     if not BOT_TOKEN:
@@ -216,6 +236,21 @@ def handle_telegram_commands():
                 else:
                     send_telegram("Use /why TICKER, example: /why PLTR")
 
+            elif text.startswith("/sync ") or text.startswith("/sync_open ") or text.startswith("/setopen "):
+                # Paste the exact Streamlit Main Kalman OPEN/LONG list.
+                # Example: /sync PLTR,AAPL,NVDA
+                cmd = text.split()[0]
+                raw = text.replace(cmd, "", 1).strip()
+                syms = parse_ticker_csv(raw)
+                synced = sync_streamlit_open_ledger(syms)
+                send_telegram(
+                    "✅ <b>Synced Render ledger to Streamlit open list.</b>\n"
+                    f"LONG set: <b>{len(synced)}</b>\n"
+                    + (", ".join(synced[:120]) if synced else "No tickers matched watchlist")
+                    + (f"\n...and {len(synced)-120} more" if len(synced) > 120 else "")
+                    + "\n\nNow use /status. From this point, Render will track NEW transitions from that ledger."
+                )
+
             elif text.startswith("/seed "):
                 raw = text.replace("/seed", "", 1).strip().upper()
                 syms = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
@@ -243,6 +278,7 @@ def handle_telegram_commands():
                 msg = "⚙️ <b>Main Kalman Params</b>\n" + "\n".join([f"{k}: <b>{v}</b>" for k, v in PARAMS.items()])
                 msg += f"\nSTREAMLIT_OPEN_TICKERS: <b>{','.join(sorted(STREAMLIT_OPEN_TICKERS)) if STREAMLIT_OPEN_TICKERS else 'NONE'}</b>"
                 msg += f"\nPER_TICKER_PARAMS loaded: <b>{len(PER_TICKER_PARAMS)}</b>"
+                msg += "\nCommands: /status, /why TICKER, /sync T1,T2,T3, /seed T1,T2, /unseed T1\nMode: LEDGER — after /sync, only latest-bar transitions change state"
                 send_telegram(msg)
     except Exception as e:
         print(f"Telegram command error: {e}")
@@ -657,25 +693,32 @@ def scan_once():
                 continue
 
             old_state = positions.get(ticker, "UNKNOWN")
-            raw_new_state = info["position"]
-            new_state = raw_new_state
+            raw_new_state = info["position"]          # full historical recompute status
+            raw_alert = info.get("alert", "NO NEW ALERT")  # only the latest-bar transition
 
-            # If user seeded Streamlit-visible open tickers, do NOT let Render rewrite
-            # that old open trade to CASH on startup or on repeated scans of the same candle.
-            # Once a newer completed candle appears, Render may close it normally.
-            if ticker in STREAMLIT_OPEN_TICKERS:
-                current_bar_key = info["candle_close_ct"].strftime("%Y-%m-%d %H:%M:%S")
-                if ticker not in seed_protected_until_bar and raw_new_state == "CASH" and old_state == "LONG":
-                    seed_protected_until_bar[ticker] = current_bar_key
+            # ============================================================
+            # LEDGER MODE — this is the important fix.
+            #
+            # Streamlit's visible trade log is an account ledger. Render must not
+            # overwrite a synced Streamlit-open trade just because a full historical
+            # recompute currently ends in CASH. After /sync, the saved ledger is the
+            # source of truth. Render only changes state when the latest completed
+            # candle creates a NEW BUY/SELL transition.
+            # ============================================================
+            if old_state == "UNKNOWN":
+                # Before the first baseline or before /sync, initialize from the
+                # recomputed state. After /sync, old_state should never be UNKNOWN.
+                new_state = raw_new_state
+            else:
+                new_state = old_state
+                if old_state == "CASH" and raw_alert == "BUY":
                     new_state = "LONG"
-                elif raw_new_state == "CASH" and old_state == "LONG" and seed_protected_until_bar.get(ticker) == current_bar_key:
-                    new_state = "LONG"
+                elif old_state == "LONG" and raw_alert == "SELL":
+                    new_state = "CASH"
 
             last_checked[ticker] = info["candle_close_ct"].strftime("%Y-%m-%d %I:%M %p CT")
             last_error.pop(ticker, None)
 
-            # Streamlit watchlist behavior: first full pass is a BASELINE, not an alert storm.
-            # Then alerts are based on actual Render state transitions, not simply latest_sig vs prev_sig.
             transition_alert = "NO NEW ALERT"
             if old_state == "CASH" and new_state == "LONG":
                 transition_alert = "BUY"
@@ -707,7 +750,7 @@ def scan_once():
                     f"Price: <b>{info['price']:.2f}</b>\n"
                     f"Rail: <b>{info['rail']:.2f}</b>\n"
                     f"Candle Close CT: <b>{info['candle_close_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
-                    f"Source: Main Kalman Trend Rail logic + transition ledger"
+                    f"Source: Main Kalman ledger mode + latest-bar transition"
                 )
                 send_telegram(msg)
                 print(f"📊 {ticker}: {old_state} -> {new_state} | {transition_alert} | {info['price']:.2f}")
@@ -730,11 +773,12 @@ def scan_once():
 
 if __name__ == "__main__":
     load_state()
-    print("🚀 Pinehurst Main Kalman Render Engine Active")
+    print("🚀 Pinehurst Main Kalman Render Engine Active — Ledger Mode")
     print(f"Interval={INTERVAL} Period={PERIOD} Watchlist={len(WATCHLIST)}")
     print("Params:", PARAMS)
     print("Streamlit seed opens:", sorted(STREAMLIT_OPEN_TICKERS))
-    send_telegram(f"🚀 <b>Pinehurst Main Kalman Render Engine Active</b>\nStarting baseline scan. Use /status after full scan count is at least 1.")
+    print("Sync command: /sync PLTR,AAPL,NVDA  # paste exact Streamlit open list")
+    send_telegram(f"🚀 <b>Pinehurst Main Kalman Render Engine Active — Ledger Mode</b>\nUse /sync with your exact Streamlit OPEN list. After sync, Render will not overwrite open trades from historical recompute; it only changes state on latest-bar BUY/SELL transitions.")
 
     while True:
         scan_once()

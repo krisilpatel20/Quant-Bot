@@ -113,18 +113,43 @@ sync_wait_notice_sent = False
 # ============================================================
 # TELEGRAM HELPERS
 # ============================================================
+def _plain_from_html(text: str) -> str:
+    """Very small fallback for Telegram if HTML parse fails."""
+    return (text or "").replace("<b>", "").replace("</b>", "")
+
+
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram disabled: BOT_TOKEN or CHAT_ID missing")
         return False
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.post(url, json=payload, timeout=8)
-        return r.ok
+        chunks = []
+        txt = str(text or "")
+        # Telegram max is 4096. Keep it lower to avoid HTML/cutoff issues.
+        while len(txt) > 3500:
+            cut = txt.rfind("\n", 0, 3500)
+            if cut < 1000:
+                cut = 3500
+            chunks.append(txt[:cut])
+            txt = txt[cut:].lstrip()
+        chunks.append(txt)
+
+        ok_all = True
+        for ch in chunks:
+            payload = {"chat_id": CHAT_ID, "text": ch, "parse_mode": "HTML", "disable_web_page_preview": True}
+            r = requests.post(url, json=payload, timeout=8)
+            if not r.ok:
+                # Fallback without HTML parse mode so /status never silently fails.
+                payload = {"chat_id": CHAT_ID, "text": _plain_from_html(ch), "disable_web_page_preview": True}
+                r2 = requests.post(url, json=payload, timeout=8)
+                if not r2.ok:
+                    print(f"Telegram send failed: {r.status_code} {r.text} | fallback: {r2.status_code} {r2.text}")
+                    ok_all = False
+        return ok_all
     except Exception as e:
         print(f"Telegram send error: {e}")
         return False
-
 
 def load_state():
     global positions, last_alert_bar, seed_protected_until_bar, ledger_synced
@@ -197,75 +222,117 @@ def sync_streamlit_open_ledger(open_tickers):
     save_state()
     return sorted(clean)
 
+
+
+def _load_update_offset():
+    global last_update_id
+    try:
+        if os.path.exists(UPDATE_OFFSET_FILE):
+            data = json.load(open(UPDATE_OFFSET_FILE, "r"))
+            val = data.get("last_update_id")
+            if isinstance(val, int):
+                last_update_id = val
+    except Exception as e:
+        print(f"Could not load Telegram update offset: {e}")
+
+
+def _save_update_offset():
+    try:
+        json.dump({"last_update_id": last_update_id}, open(UPDATE_OFFSET_FILE, "w"))
+    except Exception as e:
+        print(f"Could not save Telegram update offset: {e}")
+
+
+def _parse_command(raw_text: str):
+    """Supports /status, /status@BotName, mixed case, and arguments."""
+    raw = (raw_text or "").strip()
+    if not raw.startswith("/"):
+        return "", "", raw
+    parts = raw.split(maxsplit=1)
+    cmd = parts[0].lower().split("@", 1)[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    return cmd, arg, raw
 def handle_telegram_commands():
     global last_update_id, rescan_requested, STREAMLIT_OPEN_TICKERS
     if not BOT_TOKEN:
         return
     try:
-        offset = "" if last_update_id is None else str(last_update_id)
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?timeout=0&offset={offset}"
-        resp = requests.get(url, timeout=5).json()
+        offset = None if last_update_id is None else str(last_update_id)
+        params = {"timeout": 0}
+        if offset is not None:
+            params["offset"] = offset
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        resp = requests.get(url, params=params, timeout=8).json()
+        if not resp.get("ok", True):
+            print(f"Telegram getUpdates not ok: {resp}")
+            return
+
         for res in resp.get("result", []):
             last_update_id = int(res["update_id"]) + 1
-            text = res.get("message", {}).get("text", "").strip().lower()
-            if text == "/status":
-                longs = sorted([t for t, s in positions.items() if s == "LONG"])
-                cash = sorted([t for t, s in positions.items() if s == "CASH"])
-                unknown = sorted([t for t, s in positions.items() if s not in ("LONG", "CASH")])
+            _save_update_offset()
+
+            msg_obj = res.get("message") or res.get("edited_message") or {}
+            raw_text = msg_obj.get("text", "")
+            cmd, arg, raw = _parse_command(raw_text)
+            if not cmd:
+                continue
+
+            if cmd == "/status":
+                longs = sorted([t for t, st in positions.items() if st == "LONG"])
+                cash = sorted([t for t, st in positions.items() if st == "CASH"])
+                unknown = sorted([t for t, st in positions.items() if st not in ("LONG", "CASH")])
                 failed = sorted([t for t in WATCHLIST if last_error.get(t)])
                 verified = len(longs) + len(cash)
                 header_note = ""
                 if scan_in_progress:
                     header_note = "\n⏳ <b>Scan in progress.</b> Some tickers may still be from the previous scan."
-                if full_scans_completed == 0:
+                if REQUIRE_STREAMLIT_SYNC and not ledger_synced:
+                    header_note += "\n🛑 <b>Waiting for /sync.</b> Scanning is locked so UNKNOWN names are not turned into fake CASH."
+                elif full_scans_completed == 0:
                     header_note += "\n⚠️ <b>No full baseline scan completed yet.</b> UNKNOWN/default tickers are not real CASH."
+
                 msg = (
                     f"📋 <b>Main Kalman Status — {fmt_ct_now()}</b>\n"
                     f"Interval: <b>{INTERVAL}</b> | Period: <b>{PERIOD}</b>\n"
                     f"Verified: <b>{verified}/{len(WATCHLIST)}</b> | Full scans: <b>{full_scans_completed}</b>{header_note}\n"
-                    f"Streamlit seed opens: <b>{len(STREAMLIT_OPEN_TICKERS)}</b> | Ledger synced: <b>{ledger_synced}</b> | Require sync: <b>{REQUIRE_STREAMLIT_SYNC}</b>\n"
+                    f"Ledger synced: <b>{ledger_synced}</b> | Require sync: <b>{REQUIRE_STREAMLIT_SYNC}</b> | Streamlit opens: <b>{len(STREAMLIT_OPEN_TICKERS)}</b>\n"
                     f"{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN / {len(failed)} DATA ERRORS\n\n"
                     + ("<b>LONG</b>\n" + "".join([f"🟢 {t}\n" for t in longs]) if longs else "<b>LONG</b>\nNone\n")
                     + "\n<b>CASH</b>\n"
                     + ("".join([f"⚪ {t}\n" for t in cash]) if cash else "None\n")
                 )
                 if unknown:
-                    msg += "\n<b>UNKNOWN / NOT VERIFIED YET</b>\n" + "".join([f"❔ {t}\n" for t in unknown[:80]])
-                    if len(unknown) > 80:
-                        msg += f"...and {len(unknown)-80} more\n"
+                    msg += "\n<b>UNKNOWN / NOT VERIFIED YET</b>\n" + "".join([f"❔ {t}\n" for t in unknown])
                 if failed:
-                    msg += "\n<b>DATA ERRORS</b>\n" + "".join([f"⚠️ {t}: {last_error.get(t)}\n" for t in failed[:30]])
-                    if len(failed) > 30:
-                        msg += f"...and {len(failed)-30} more\n"
-                send_telegram(msg[:3900])
-            elif text == "/rescan":
+                    msg += "\n<b>DATA ERRORS</b>\n" + "".join([f"⚠️ {t}: {last_error.get(t)}\n" for t in failed[:60]])
+                send_telegram(msg)
+
+            elif cmd == "/ping":
+                send_telegram(f"✅ <b>Bot is alive.</b> {fmt_ct_now()}\nLedger synced: <b>{ledger_synced}</b> | Require sync: <b>{REQUIRE_STREAMLIT_SYNC}</b>")
+
+            elif cmd == "/rescan":
                 rescan_requested = True
                 send_telegram("🔄 <b>Rescan requested.</b> I will refresh the full watchlist on this worker loop.")
-            elif text.startswith("/why ") or text.startswith("/debug "):
-                parts = text.split()
-                if len(parts) >= 2:
-                    send_telegram(debug_ticker(parts[1].upper())[:3900])
+
+            elif cmd in ("/why", "/debug"):
+                if arg:
+                    send_telegram(debug_ticker(arg.split()[0].upper()))
                 else:
                     send_telegram("Use /why TICKER, example: /why PLTR")
 
-            elif text.startswith("/sync ") or text.startswith("/sync_open ") or text.startswith("/setopen "):
-                # Paste the exact Streamlit Main Kalman OPEN/LONG list.
-                # Example: /sync PLTR,AAPL,NVDA
-                cmd = text.split()[0]
-                raw = text.replace(cmd, "", 1).strip()
-                syms = parse_ticker_csv(raw)
+            elif cmd in ("/sync", "/sync_open", "/setopen"):
+                syms = parse_ticker_csv(arg)
                 synced = sync_streamlit_open_ledger(syms)
                 send_telegram(
                     "✅ <b>Synced Render ledger to Streamlit open list.</b>\n"
                     f"LONG set: <b>{len(synced)}</b>\n"
                     + (", ".join(synced[:120]) if synced else "No tickers matched watchlist")
                     + (f"\n...and {len(synced)-120} more" if len(synced) > 120 else "")
-                    + "\n\nNow use /status. From this point, Render will track NEW transitions from that ledger."
+                    + "\n\nNow use /status. From this point, Render tracks NEW transitions from that ledger."
                 )
 
-            elif text.startswith("/seed "):
-                raw = text.replace("/seed", "", 1).strip().upper()
-                syms = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+            elif cmd == "/seed":
+                syms = parse_ticker_csv(arg)
                 added = []
                 for t in syms:
                     if t in WATCHLIST:
@@ -275,9 +342,9 @@ def handle_telegram_commands():
                         added.append(t)
                 save_state()
                 send_telegram("✅ <b>Seeded Streamlit-open tickers as LONG:</b> " + (", ".join(sorted(added)) if added else "None matched watchlist"))
-            elif text.startswith("/unseed "):
-                raw = text.replace("/unseed", "", 1).strip().upper()
-                syms = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+            elif cmd == "/unseed":
+                syms = parse_ticker_csv(arg)
                 removed = []
                 for t in syms:
                     if t in STREAMLIT_OPEN_TICKERS:
@@ -286,16 +353,20 @@ def handle_telegram_commands():
                         removed.append(t)
                 save_state()
                 send_telegram("🧹 <b>Removed Streamlit seed tickers:</b> " + (", ".join(sorted(removed)) if removed else "None"))
-            elif text == "/params":
+
+            elif cmd == "/params":
                 msg = "⚙️ <b>Main Kalman Params</b>\n" + "\n".join([f"{k}: <b>{v}</b>" for k, v in PARAMS.items()])
                 msg += f"\nSTREAMLIT_OPEN_TICKERS: <b>{','.join(sorted(STREAMLIT_OPEN_TICKERS)) if STREAMLIT_OPEN_TICKERS else 'NONE'}</b>"
                 msg += f"\nPER_TICKER_PARAMS loaded: <b>{len(PER_TICKER_PARAMS)}</b>"
                 msg += f"\nREQUIRE_STREAMLIT_SYNC: <b>{REQUIRE_STREAMLIT_SYNC}</b> | ledger_synced: <b>{ledger_synced}</b>"
-                msg += "\nCommands: /status, /why TICKER, /sync T1,T2,T3, /seed T1,T2, /unseed T1\nMode: LEDGER — after /sync, only latest-bar transitions change state"
+                msg += "\nCommands: /ping, /status, /why TICKER, /sync T1,T2,T3, /seed T1,T2, /unseed T1"
                 send_telegram(msg)
+
+            else:
+                send_telegram("Commands: /ping, /status, /params, /why PLTR, /sync PLTR,AAPL,NVDA")
+
     except Exception as e:
         print(f"Telegram command error: {e}")
-
 # ============================================================
 # DATA
 # ============================================================
@@ -797,6 +868,7 @@ def scan_once():
 
 if __name__ == "__main__":
     load_state()
+    _load_update_offset()
     print("🚀 Pinehurst Main Kalman Render Engine Active — Ledger Mode")
     print(f"Interval={INTERVAL} Period={PERIOD} Watchlist={len(WATCHLIST)}")
     print("Params:", PARAMS)
@@ -810,4 +882,10 @@ if __name__ == "__main__":
         save_state()
         handle_telegram_commands()
         print(f"✅ Full scan complete. Sleeping {SLEEP_AFTER_FULL_SCAN_SEC}s")
-        time.sleep(SLEEP_AFTER_FULL_SCAN_SEC)
+        # Poll Telegram during sleep so /status works immediately instead of waiting up to 60s.
+        slept = 0.0
+        while slept < SLEEP_AFTER_FULL_SCAN_SEC:
+            handle_telegram_commands()
+            step = min(2.0, SLEEP_AFTER_FULL_SCAN_SEC - slept)
+            time.sleep(step)
+            slept += step

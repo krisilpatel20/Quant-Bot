@@ -77,7 +77,6 @@ REQUIRE_STREAMLIT_SYNC = os.environ.get("REQUIRE_STREAMLIT_SYNC", "true").lower(
 ledger_synced = False
 
 # Persistent non-repaint lock, same idea as Streamlit's .pinehurst_main_kalman_signal_lock file.
-SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v6.json")
 seed_protected_until_bar = {}
 
 
@@ -97,7 +96,9 @@ WATCHLIST = [
     "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
 
-STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v6.json")
+STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v9.json")
+SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v9.json")
+UPDATE_OFFSET_FILE = os.environ.get("UPDATE_OFFSET_FILE", "kalman_render_update_offset_v9.json")
 positions = {ticker: "UNKNOWN" for ticker in WATCHLIST}
 last_alert_bar = {}
 last_checked = {}

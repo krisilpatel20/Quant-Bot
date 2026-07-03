@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ============================================================
@@ -14,9 +14,11 @@ from zoneinfo import ZoneInfo
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 
-# How often the full watchlist is scanned after one complete pass.
-# Render background worker friendly. 300 = every 5 minutes after a pass.
-SLEEP_AFTER_FULL_SCAN_SEC = int(os.environ.get("SLEEP_AFTER_FULL_SCAN_SEC", "60"))
+# Scan schedule. For 15m candles, scan once on clock boundaries:
+# 9:00, 9:15, 9:30, 9:45, etc. CT.
+# Small delay helps yfinance publish the just-closed candle. Set 0 if you want exact boundary.
+SCAN_EVERY_MINUTES = int(os.environ.get("SCAN_EVERY_MINUTES", "15"))
+SCAN_DELAY_SECONDS = int(os.environ.get("SCAN_DELAY_SECONDS", "30"))
 SLEEP_BETWEEN_TICKERS_SEC = float(os.environ.get("SLEEP_BETWEEN_TICKERS_SEC", "0.35"))
 
 INTERVAL = os.environ.get("KALMAN_INTERVAL", "15m")
@@ -110,6 +112,7 @@ full_scans_completed = 0
 rescan_requested = False
 last_update_id = None
 sync_wait_notice_sent = False
+next_scheduled_scan_ct = None
 if not REQUIRE_STREAMLIT_SYNC:
     ledger_synced = True
 
@@ -202,6 +205,36 @@ def ct_now():
 
 def fmt_ct_now():
     return ct_now().strftime("%Y-%m-%d %I:%M %p CT")
+
+def next_quarter_scan_time(now=None):
+    """Return next CT scan time on 15-minute clock boundary plus SCAN_DELAY_SECONDS."""
+    now = now or ct_now()
+    interval = max(1, int(SCAN_EVERY_MINUTES))
+    base = now.replace(second=0, microsecond=0)
+    minute_mod = base.minute % interval
+    if minute_mod == 0 and now.second < SCAN_DELAY_SECONDS:
+        boundary = base
+    else:
+        add_min = interval - minute_mod if minute_mod else interval
+        boundary = base + timedelta(minutes=add_min)
+    return boundary + timedelta(seconds=max(0, int(SCAN_DELAY_SECONDS)))
+
+def fmt_ct_dt(dt):
+    if dt is None:
+        return "N/A"
+    return dt.strftime("%Y-%m-%d %I:%M:%S %p CT")
+
+def sleep_until_scan_time(target_dt):
+    """Sleep until target_dt while still answering Telegram commands every ~2 seconds."""
+    global rescan_requested
+    while True:
+        handle_telegram_commands()
+        if rescan_requested:
+            return "manual_rescan"
+        remaining = (target_dt - ct_now()).total_seconds()
+        if remaining <= 0:
+            return "scheduled"
+        time.sleep(min(2.0, remaining))
 
 def parse_ticker_csv(raw: str):
     raw = str(raw or "").upper().replace(";", ",").replace("\n", ",")
@@ -298,6 +331,7 @@ def handle_telegram_commands():
                     f"📋 <b>Main Kalman Status — {fmt_ct_now()}</b>\n"
                     f"Interval: <b>{INTERVAL}</b> | Period: <b>{PERIOD}</b>\n"
                     f"Verified: <b>{verified}/{len(WATCHLIST)}</b> | Full scans: <b>{full_scans_completed}</b>{header_note}\n"
+                    f"Next scheduled scan: <b>{fmt_ct_dt(next_scheduled_scan_ct)}</b> | Scan cadence: <b>every {SCAN_EVERY_MINUTES}m</b>\n"
                     f"Ledger synced: <b>{ledger_synced}</b> | Require sync: <b>{REQUIRE_STREAMLIT_SYNC}</b> | Streamlit opens: <b>{len(STREAMLIT_OPEN_TICKERS)}</b>\n"
                     f"{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN / {len(failed)} DATA ERRORS\n\n"
                     + ("<b>LONG</b>\n" + "".join([f"🟢 {t}\n" for t in longs]) if longs else "<b>LONG</b>\nNone\n")
@@ -870,24 +904,35 @@ def scan_once():
 
 
 if __name__ == "__main__":
+    global_vars = globals()
     load_state()
     _load_update_offset()
-    print("🚀 Pinehurst Main Kalman Render Engine Active — Auto Status Mode")
+    print("🚀 Pinehurst Main Kalman Render Engine Active — Scheduled 15m Mode")
     print(f"Interval={INTERVAL} Period={PERIOD} Watchlist={len(WATCHLIST)}")
+    print(f"Scan schedule: every {SCAN_EVERY_MINUTES} minutes on CT clock boundary + {SCAN_DELAY_SECONDS}s delay")
     print("Params:", PARAMS)
     print("Streamlit seed opens:", sorted(STREAMLIT_OPEN_TICKERS))
     print(f"Require Streamlit sync={REQUIRE_STREAMLIT_SYNC} ledger_synced={ledger_synced}")
-    send_telegram(f"🚀 <b>Pinehurst Main Kalman Render Engine Active — Auto Status Mode</b>\nScanning watchlist now using Streamlit Main Kalman trade-log logic: 60d / 15m / auto_adjust=True / prepost=False. Use /status after first full scan.")
+
+    next_scheduled_scan_ct = next_quarter_scan_time()
+    globals()["next_scheduled_scan_ct"] = next_scheduled_scan_ct
+    send_telegram(
+        f"🚀 <b>Pinehurst Main Kalman Render Engine Active — Scheduled 15m Mode</b>\n"
+        f"I will scan once on each 15-minute CT boundary: 9:00, 9:15, 9:30, etc. Delay: {SCAN_DELAY_SECONDS}s.\n"
+        f"Next scan: <b>{fmt_ct_dt(next_scheduled_scan_ct)}</b>. Use /status anytime."
+    )
 
     while True:
+        next_scheduled_scan_ct = next_quarter_scan_time()
+        globals()["next_scheduled_scan_ct"] = next_scheduled_scan_ct
+        print(f"⏳ Waiting until scheduled scan: {fmt_ct_dt(next_scheduled_scan_ct)}")
+        reason = sleep_until_scan_time(next_scheduled_scan_ct)
+
+        if reason == "manual_rescan":
+            rescan_requested = False
+            print("🔄 Manual /rescan requested. Running one full scan now.")
+
         scan_once()
         save_state()
         handle_telegram_commands()
-        print(f"✅ Full scan complete. Sleeping {SLEEP_AFTER_FULL_SCAN_SEC}s")
-        # Poll Telegram during sleep so /status works immediately instead of waiting up to 60s.
-        slept = 0.0
-        while slept < SLEEP_AFTER_FULL_SCAN_SEC:
-            handle_telegram_commands()
-            step = min(2.0, SLEEP_AFTER_FULL_SCAN_SEC - slept)
-            time.sleep(step)
-            slept += step
+        print("✅ Full scan complete. Next scan will be scheduled on the next 15-minute boundary.")

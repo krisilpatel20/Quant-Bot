@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ============================================================
 # TELEGRAM / RENDER ENV SETTINGS
@@ -55,8 +56,15 @@ WATCHLIST = [
 ]
 
 STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state.json")
-positions = {ticker: "CASH" for ticker in WATCHLIST}
+positions = {ticker: "UNKNOWN" for ticker in WATCHLIST}
 last_alert_bar = {}
+last_checked = {}
+last_error = {}
+scan_started_at = None
+scan_finished_at = None
+scan_in_progress = False
+full_scans_completed = 0
+rescan_requested = False
 last_update_id = None
 
 # ============================================================
@@ -82,24 +90,36 @@ def load_state():
             data = json.load(open(STATE_FILE, "r"))
             saved_pos = data.get("positions", {})
             saved_alerts = data.get("last_alert_bar", {})
+            saved_checked = data.get("last_checked", {})
+            saved_errors = data.get("last_error", {})
             for t in WATCHLIST:
-                if saved_pos.get(t) in ("LONG", "CASH"):
+                if saved_pos.get(t) in ("LONG", "CASH", "UNKNOWN"):
                     positions[t] = saved_pos[t]
             if isinstance(saved_alerts, dict):
                 last_alert_bar = saved_alerts
+            if isinstance(saved_checked, dict):
+                last_checked.update(saved_checked)
+            if isinstance(saved_errors, dict):
+                last_error.update(saved_errors)
     except Exception as e:
         print(f"State load error: {e}")
 
 
 def save_state():
     try:
-        json.dump({"positions": positions, "last_alert_bar": last_alert_bar}, open(STATE_FILE, "w"), indent=2)
+        json.dump({"positions": positions, "last_alert_bar": last_alert_bar, "last_checked": last_checked, "last_error": last_error, "full_scans_completed": full_scans_completed}, open(STATE_FILE, "w"), indent=2)
     except Exception as e:
         print(f"State save error: {e}")
 
 
+def ct_now():
+    return datetime.now(ZoneInfo("America/Chicago"))
+
+def fmt_ct_now():
+    return ct_now().strftime("%Y-%m-%d %I:%M %p CT")
+
 def handle_telegram_commands():
-    global last_update_id
+    global last_update_id, rescan_requested
     if not BOT_TOKEN:
         return
     try:
@@ -112,15 +132,35 @@ def handle_telegram_commands():
             if text == "/status":
                 longs = sorted([t for t, s in positions.items() if s == "LONG"])
                 cash = sorted([t for t, s in positions.items() if s == "CASH"])
+                unknown = sorted([t for t, s in positions.items() if s not in ("LONG", "CASH")])
+                failed = sorted([t for t in WATCHLIST if last_error.get(t)])
+                verified = len(longs) + len(cash)
+                header_note = ""
+                if scan_in_progress:
+                    header_note = "\n⏳ <b>Scan in progress.</b> Some tickers may still be from the previous scan."
+                if full_scans_completed == 0:
+                    header_note += "\n⚠️ <b>No full baseline scan completed yet.</b> UNKNOWN/default tickers are not real CASH."
                 msg = (
-                    f"📋 <b>Main Kalman Status — {datetime.now().strftime('%Y-%m-%d %I:%M %p')}</b>\n"
+                    f"📋 <b>Main Kalman Status — {fmt_ct_now()}</b>\n"
                     f"Interval: <b>{INTERVAL}</b> | Period: <b>{PERIOD}</b>\n"
-                    f"{len(longs)} LONG / {len(cash)} CASH\n\n"
+                    f"Verified: <b>{verified}/{len(WATCHLIST)}</b> | Full scans: <b>{full_scans_completed}</b>{header_note}\n"
+                    f"{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN / {len(failed)} DATA ERRORS\n\n"
                     + ("<b>LONG</b>\n" + "".join([f"🟢 {t}\n" for t in longs]) if longs else "<b>LONG</b>\nNone\n")
                     + "\n<b>CASH</b>\n"
-                    + "".join([f"⚪ {t}\n" for t in cash])
+                    + ("".join([f"⚪ {t}\n" for t in cash]) if cash else "None\n")
                 )
-                send_telegram(msg)
+                if unknown:
+                    msg += "\n<b>UNKNOWN / NOT VERIFIED YET</b>\n" + "".join([f"❔ {t}\n" for t in unknown[:80]])
+                    if len(unknown) > 80:
+                        msg += f"...and {len(unknown)-80} more\n"
+                if failed:
+                    msg += "\n<b>DATA ERRORS</b>\n" + "".join([f"⚠️ {t}: {last_error.get(t)}\n" for t in failed[:30]])
+                    if len(failed) > 30:
+                        msg += f"...and {len(failed)-30} more\n"
+                send_telegram(msg[:3900])
+            elif text == "/rescan":
+                rescan_requested = True
+                send_telegram("🔄 <b>Rescan requested.</b> I will refresh the full watchlist on this worker loop.")
             elif text == "/params":
                 msg = "⚙️ <b>Main Kalman Params</b>\n" + "\n".join([f"{k}: <b>{v}</b>" for k, v in PARAMS.items()])
                 send_telegram(msg)
@@ -350,12 +390,18 @@ def latest_kalman_state(ticker: str):
 # ENGINE LOOP
 # ============================================================
 def scan_once():
+    global scan_started_at, scan_finished_at, scan_in_progress, full_scans_completed
+    scan_in_progress = True
+    scan_started_at = fmt_ct_now()
     handle_telegram_commands()
 
     for ticker in WATCHLIST:
         try:
             info = latest_kalman_state(ticker)
             if info is None:
+                positions[ticker] = "UNKNOWN"
+                last_error[ticker] = "not enough data / no yfinance data"
+                last_checked[ticker] = fmt_ct_now()
                 print(f"⚠️ {ticker}: not enough data")
                 time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
                 continue
@@ -363,6 +409,8 @@ def scan_once():
             old_state = positions.get(ticker, "CASH")
             new_state = info["position"]
             positions[ticker] = new_state
+            last_checked[ticker] = info["candle_close_ct"].strftime("%Y-%m-%d %I:%M %p CT")
+            last_error.pop(ticker, None)
 
             bar_key = f"{ticker}|{info['alert']}|{info['candle_close_ct'].strftime('%Y-%m-%d %H:%M:%S')}"
 
@@ -386,8 +434,15 @@ def scan_once():
             save_state()
             time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
         except Exception as e:
+            positions[ticker] = "UNKNOWN"
+            last_error[ticker] = str(e)[:120]
+            last_checked[ticker] = fmt_ct_now()
             print(f"{ticker} scan error: {e}")
             time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
+
+    scan_in_progress = False
+    scan_finished_at = fmt_ct_now()
+    full_scans_completed += 1
 
 
 if __name__ == "__main__":
@@ -395,7 +450,7 @@ if __name__ == "__main__":
     print("🚀 Pinehurst Main Kalman Render Engine Active")
     print(f"Interval={INTERVAL} Period={PERIOD} Watchlist={len(WATCHLIST)}")
     print("Params:", PARAMS)
-    send_telegram("🚀 <b>Pinehurst Main Kalman Render Engine Active</b>")
+    send_telegram(f"🚀 <b>Pinehurst Main Kalman Render Engine Active</b>\nStarting baseline scan. Use /status after full scan count is at least 1.")
 
     while True:
         scan_once()

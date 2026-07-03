@@ -39,6 +39,31 @@ PARAMS = {
     "atr_safety": os.environ.get("KALMAN_ATR_SAFETY", "true").lower() == "true",
 }
 
+# Optional: paste/export Streamlit's saved per-ticker optimized params here through Render env.
+# Example Render env PER_TICKER_PARAMS_JSON:
+# {"PLTR":{"buffer_pct":0.02,"confirm_bars":4,"min_hold_bars":8,"cooldown_bars":3}}
+def _load_per_ticker_params():
+    raw = os.environ.get("PER_TICKER_PARAMS_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k).upper(): v for k, v in data.items() if isinstance(v, dict)}
+    except Exception as e:
+        print(f"PER_TICKER_PARAMS_JSON parse error: {e}")
+        return {}
+
+PER_TICKER_PARAMS = _load_per_ticker_params()
+
+# Safer alert behavior: baseline first, then alert only on Render state transitions.
+# This prevents false SELL messages from a historical last-bar recompute when the app was never baselined.
+ALERTS_AFTER_BASELINE_ONLY = os.environ.get("ALERTS_AFTER_BASELINE_ONLY", "true").lower() == "true"
+SELL_CONFIRM_SCANS = int(os.environ.get("SELL_CONFIRM_SCANS", "1"))
+pending_sell_counts = {}
+
+
 WATCHLIST = [
     "AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR",
     "AMZN", "APEI", "APLD", "APP", "APPF", "APPS", "ARQQ", "ASTS", "AVGO", "AXON", "AXP", "AZZ",
@@ -295,37 +320,55 @@ def institutional_trend_rail(prices, fast_gain=0.34, slow_gain=0.055, polish_spa
     return rail.values, center.values, long_state
 
 
-def build_main_kalman_signal(px: pd.Series):
+def params_for_ticker(ticker: str):
+    p = dict(PARAMS)
+    override = PER_TICKER_PARAMS.get(str(ticker).upper(), {})
+    for k, v in override.items():
+        if k in p:
+            try:
+                if isinstance(p[k], bool):
+                    p[k] = bool(v)
+                elif isinstance(p[k], int):
+                    p[k] = int(v)
+                else:
+                    p[k] = float(v)
+            except Exception:
+                pass
+    return p
+
+
+def build_main_kalman_signal(px: pd.Series, ticker: str = ""):
+    pms = params_for_ticker(ticker)
     rail, center, long_state = institutional_trend_rail(
         px,
-        fast_gain=PARAMS["fast_gain"],
-        slow_gain=PARAMS["slow_gain"],
-        polish_span=PARAMS["polish_span"],
-        atr_window=PARAMS["atr_window"],
-        atr_mult=PARAMS["rail_mult"],
+        fast_gain=pms["fast_gain"],
+        slow_gain=pms["slow_gain"],
+        polish_span=pms["polish_span"],
+        atr_window=pms["atr_window"],
+        atr_mult=pms["rail_mult"],
     )
 
     rail_s = pd.Series(rail, index=px.index).ffill().bfill()
     trend_slope = rail_s.diff().ewm(span=5, adjust=False).mean().fillna(0)
 
-    close_above = px > rail_s * (1.0 + PARAMS["buffer_pct"])
-    close_below = px < rail_s * (1.0 - PARAMS["buffer_pct"])
+    close_above = px > rail_s * (1.0 + pms["buffer_pct"])
+    close_below = px < rail_s * (1.0 - pms["buffer_pct"])
 
-    if PARAMS["slope_confirm"]:
+    if pms["slope_confirm"]:
         entry_cond = close_above & (trend_slope >= 0)
         exit_cond = close_below & (trend_slope <= 0)
     else:
         entry_cond = close_above
         exit_cond = close_below
 
-    if PARAMS["atr_safety"]:
+    if pms["atr_safety"]:
         atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
         safety_exit = px < (rail_s - 1.25 * atr_proxy)
         exit_cond = exit_cond | safety_exit.fillna(False)
 
-    confirm_bars = int(PARAMS["confirm_bars"])
-    min_hold_bars = int(PARAMS["min_hold_bars"])
-    cooldown_bars = int(PARAMS["cooldown_bars"])
+    confirm_bars = int(pms["confirm_bars"])
+    min_hold_bars = int(pms["min_hold_bars"])
+    cooldown_bars = int(pms["cooldown_bars"])
 
     entry_ready = entry_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
     exit_ready = exit_cond.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars).fillna(False)
@@ -365,7 +408,7 @@ def latest_kalman_state(ticker: str):
     if px is None or len(px) < 80:
         return None
 
-    sig, rail_s = build_main_kalman_signal(px)
+    sig, rail_s = build_main_kalman_signal(px, ticker)
     latest_sig = int(sig.iloc[-1])
     prev_sig = int(sig.iloc[-2]) if len(sig) >= 2 else latest_sig
 
@@ -385,6 +428,52 @@ def latest_kalman_state(ticker: str):
         "bar_start_ct": last_start,
         "candle_close_ct": candle_close,
     }
+
+
+def debug_ticker(ticker: str):
+    """Telegram /why TICKER helper so we can see why Render differs from Streamlit."""
+    ticker = str(ticker).upper().strip()
+    try:
+        px = fetch_completed_bars(ticker)
+        if px is None or len(px) < 80:
+            return f"⚠️ {ticker}: no enough completed bars from yfinance."
+        pms = params_for_ticker(ticker)
+        sig, rail_s = build_main_kalman_signal(px, ticker)
+        trend_slope = rail_s.diff().ewm(span=5, adjust=False).mean().fillna(0)
+        close_above = px > rail_s * (1.0 + pms["buffer_pct"])
+        close_below = px < rail_s * (1.0 - pms["buffer_pct"])
+        if pms["slope_confirm"]:
+            entry_cond = close_above & (trend_slope >= 0)
+            exit_cond = close_below & (trend_slope <= 0)
+        else:
+            entry_cond = close_above
+            exit_cond = close_below
+        if pms["atr_safety"]:
+            atr_proxy = px.diff().abs().ewm(span=14, adjust=False).mean().replace(0, np.nan).ffill().bfill()
+            safety_exit = px < (rail_s - 1.25 * atr_proxy)
+            exit_cond = exit_cond | safety_exit.fillna(False)
+        cb = int(pms["confirm_bars"])
+        exit_ready = exit_cond.rolling(cb, min_periods=cb).sum().eq(cb).fillna(False)
+        entry_ready = entry_cond.rolling(cb, min_periods=cb).sum().eq(cb).fillna(False)
+        i = -1
+        candle_close = pd.Timestamp(px.index[i]) + pd.Timedelta(minutes=15 if INTERVAL == "15m" else 5 if INTERVAL == "5m" else 30 if INTERVAL == "30m" else 60)
+        lines = [
+            f"<b>Render Kalman Debug — {ticker}</b>",
+            f"Position now: {'LONG' if int(sig.iloc[i]) == 1 else 'CASH'} | Prev: {'LONG' if int(sig.iloc[i-1]) == 1 else 'CASH'}",
+            f"Price: {float(px.iloc[i]):.2f} | Rail: {float(rail_s.iloc[i]):.2f}",
+            f"Candle Close CT: {candle_close.strftime('%Y-%m-%d %I:%M %p CT')}",
+            f"close_above: {bool(close_above.iloc[i])} | close_below: {bool(close_below.iloc[i])}",
+            f"entry_ready: {bool(entry_ready.iloc[i])} | exit_ready: {bool(exit_ready.iloc[i])}",
+            f"trend_slope: {float(trend_slope.iloc[i]):.5f}",
+            f"params: buffer={pms['buffer_pct']}, confirm={pms['confirm_bars']}, hold={pms['min_hold_bars']}, cool={pms['cooldown_bars']}, rail_mult={pms['rail_mult']}",
+        ]
+        if ticker in PER_TICKER_PARAMS:
+            lines.append("Per-ticker override: YES")
+        else:
+            lines.append("Per-ticker override: NO — using defaults")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"⚠️ {ticker} debug error: {e}"
 
 # ============================================================
 # ENGINE LOOP
@@ -406,30 +495,50 @@ def scan_once():
                 time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
                 continue
 
-            old_state = positions.get(ticker, "CASH")
+            old_state = positions.get(ticker, "UNKNOWN")
             new_state = info["position"]
-            positions[ticker] = new_state
             last_checked[ticker] = info["candle_close_ct"].strftime("%Y-%m-%d %I:%M %p CT")
             last_error.pop(ticker, None)
 
-            bar_key = f"{ticker}|{info['alert']}|{info['candle_close_ct'].strftime('%Y-%m-%d %H:%M:%S')}"
+            # Streamlit watchlist behavior: first full pass is a BASELINE, not an alert storm.
+            # Then alerts are based on actual Render state transitions, not simply latest_sig vs prev_sig.
+            transition_alert = "NO NEW ALERT"
+            if old_state == "CASH" and new_state == "LONG":
+                transition_alert = "BUY"
+            elif old_state == "LONG" and new_state == "CASH":
+                transition_alert = "SELL"
 
-            if info["alert"] in ("BUY", "SELL") and last_alert_bar.get(ticker) != bar_key:
+            # Optional extra protection: require SELL condition to persist across N scans.
+            if transition_alert == "SELL" and SELL_CONFIRM_SCANS > 1:
+                pending_sell_counts[ticker] = pending_sell_counts.get(ticker, 0) + 1
+                if pending_sell_counts[ticker] < SELL_CONFIRM_SCANS:
+                    # Hold the live displayed state until sell is reconfirmed.
+                    new_state = "LONG"
+                    transition_alert = "NO NEW ALERT"
+            else:
+                pending_sell_counts[ticker] = 0
+
+            positions[ticker] = new_state
+
+            bar_key = f"{ticker}|{transition_alert}|{info['candle_close_ct'].strftime('%Y-%m-%d %H:%M:%S')}"
+            baseline_done = full_scans_completed > 0 or not ALERTS_AFTER_BASELINE_ONLY
+
+            if baseline_done and transition_alert in ("BUY", "SELL") and last_alert_bar.get(ticker) != bar_key:
                 last_alert_bar[ticker] = bar_key
-                emoji = "🟢" if info["alert"] == "BUY" else "🔴"
+                emoji = "🟢" if transition_alert == "BUY" else "🔴"
                 msg = (
-                    f"{emoji} <b>PINEHURST MAIN KALMAN {info['alert']}</b>\n"
+                    f"{emoji} <b>PINEHURST MAIN KALMAN {transition_alert}</b>\n"
                     f"Ticker: <b>{ticker}</b>\n"
                     f"Position: <b>{new_state}</b>\n"
                     f"Price: <b>{info['price']:.2f}</b>\n"
                     f"Rail: <b>{info['rail']:.2f}</b>\n"
                     f"Candle Close CT: <b>{info['candle_close_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
-                    f"Source: Main Kalman Trend Rail logic"
+                    f"Source: Main Kalman Trend Rail logic + transition ledger"
                 )
                 send_telegram(msg)
-                print(f"📊 {ticker}: {old_state} -> {new_state} | {info['alert']} | {info['price']:.2f}")
+                print(f"📊 {ticker}: {old_state} -> {new_state} | {transition_alert} | {info['price']:.2f}")
             else:
-                print(f"{ticker}: {new_state} | {info['price']:.2f}")
+                print(f"{ticker}: {new_state} | {info['price']:.2f} | old={old_state} raw={info['alert']}")
 
             save_state()
             time.sleep(SLEEP_BETWEEN_TICKERS_SEC)

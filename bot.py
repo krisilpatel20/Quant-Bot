@@ -9,10 +9,10 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ============================================================
-# PINEHURST MAIN KALMAN — STREAMLIT TRUE MIRROR v14
+# PINEHURST MAIN KALMAN — STREAMLIT FULL 150 VERIFY v17
 # ============================================================
-# This worker mirrors the uploaded Streamlit Main Kalman production path:
-#   • visible 15m tab uses ~30 calendar days of data
+# This worker mirrors the uploaded Streamlit Main Kalman visible-tab production path:
+#   • live 15m Main Kalman uses 30 calendar days of data
 #   • yfinance auto_adjust=False
 #   • same CT timezone conversion and dropna cleaning
 #   • same adaptive Kalman + institutional trend rail
@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 # IMPORTANT:
 # For existing Streamlit positions/history to match, upload the read-only
 # Streamlit state bundle as a Render Secret File:
-#   /etc/secrets/streamlit_kalman_state.json
+#   /etc/secrets/streamlit_kalman_render_bundle.json
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
@@ -58,13 +58,13 @@ EQUITY_DD_STOP_PCT = float(os.environ.get("KALMAN_EQUITY_DD_STOP_PCT", "28.0"))
 FIREWALL_COOLDOWN = int(os.environ.get("KALMAN_FIREWALL_COOLDOWN", "8"))
 USE_INSTITUTIONAL_LEDGER = os.environ.get("KALMAN_INSTITUTIONAL_LIVE_LEDGER", "true").lower() == "true"
 
-BUNDLE_FILE = os.environ.get("STREAMLIT_KALMAN_BUNDLE_FILE", "/etc/secrets/streamlit_kalman_state.json")
+BUNDLE_FILE = os.environ.get("STREAMLIT_KALMAN_BUNDLE_FILE", "/etc/secrets/streamlit_kalman_render_bundle.json")
 PARAMS_SECRET_FILE = os.environ.get("KALMAN_PARAMS_SECRET_FILE", "/etc/secrets/kalman_params.json")
 
-STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v14.json")
-SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v14.json")
-INSTITUTIONAL_LEDGER_FILE = os.environ.get("INSTITUTIONAL_LEDGER_FILE", "kalman_render_institutional_ledger_v14.json")
-UPDATE_OFFSET_FILE = os.environ.get("UPDATE_OFFSET_FILE", "kalman_render_update_offset_v14.json")
+STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v17.json")
+SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v17.json")
+INSTITUTIONAL_LEDGER_FILE = os.environ.get("INSTITUTIONAL_LEDGER_FILE", "kalman_render_institutional_ledger_v17.json")
+UPDATE_OFFSET_FILE = os.environ.get("UPDATE_OFFSET_FILE", "kalman_render_update_offset_v17.json")
 
 WATCHLIST = [
     "AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR",
@@ -115,10 +115,23 @@ def load_streamlit_bundle():
         signal_lock = {}
     if not isinstance(institutional_ledger, dict):
         institutional_ledger = {}
+    open_tickers = data.get("streamlit_open_tickers", [])
+    if not isinstance(open_tickers, list):
+        open_tickers = []
+    sync_summary = data.get("sync_summary", {})
+    if not isinstance(sync_summary, dict):
+        sync_summary = {}
+    data_path = data.get("data_path", {})
+    if not isinstance(data_path, dict):
+        data_path = {}
     return {
         "per_ticker_params": {str(k).upper(): v for k, v in params.items() if isinstance(v, dict)},
         "signal_lock": signal_lock,
         "institutional_ledger": institutional_ledger,
+        "streamlit_open_tickers": sorted({str(x).upper() for x in open_tickers if str(x).strip()}),
+        "sync_summary": sync_summary,
+        "data_path": data_path,
+        "bundle_version": data.get("bundle_version", 0),
         "exported_ct": data.get("exported_ct", ""),
     }
 
@@ -147,6 +160,19 @@ def _load_per_ticker_params():
     return {}
 
 PER_TICKER_PARAMS = _load_per_ticker_params()
+
+# Full 150-ticker coverage verification. The worker still has a 150-name watchlist,
+# but now it explicitly reports whether every watchlist ticker has a parameter record.
+PARAM_TICKERS = set(PER_TICKER_PARAMS.keys())
+MISSING_PARAM_TICKERS = sorted(set(WATCHLIST) - PARAM_TICKERS)
+EXTRA_PARAM_TICKERS = sorted(PARAM_TICKERS - set(WATCHLIST))
+PARAM_COVERAGE_OK = (len(MISSING_PARAM_TICKERS) == 0 and len(WATCHLIST) == 150)
+
+def param_source_for_ticker(ticker):
+    rec = PER_TICKER_PARAMS.get(str(ticker).upper(), {})
+    if isinstance(rec, dict):
+        return str(rec.get("_sync_source", rec.get("source", "BUNDLE_OR_SAVED_PARAMS")))
+    return "DEFAULTS"
 
 def params_for_ticker(ticker):
     p = dict(PARAMS)
@@ -256,6 +282,22 @@ def seed_streamlit_state_once():
         if seed:
             _save_json_file(INSTITUTIONAL_LEDGER_FILE, seed)
             print(f"Seeded Render institutional ledger from Streamlit bundle: {len(seed)} tickers")
+
+def seed_positions_from_streamlit_bundle_once():
+    """Baseline Render LONG/CASH from the exact Streamlit bundle on a fresh v16 state file."""
+    try:
+        if os.path.exists(STATE_FILE):
+            return
+        opens = set(STREAMLIT_BUNDLE.get("streamlit_open_tickers", []))
+        if not opens:
+            return
+        for t in WATCHLIST:
+            positions[t] = "LONG" if t in opens else "CASH"
+        save_state()
+        print(f"Seeded Render positions from Streamlit bundle: {len(opens)} LONG / {len(WATCHLIST)-len(opens)} CASH")
+    except Exception as e:
+        print(f"Position seed error: {e}")
+
 
 def load_signal_lock():
     return _load_json_file(SIGNAL_LOCK_FILE, {})
@@ -663,7 +705,7 @@ def _safe_str_dt(v):
 
 def settings_for_institutional_ledger(ticker):
     p = params_for_ticker(ticker)
-    source = "Per-ticker saved optimizer" if str(ticker).upper() in PER_TICKER_PARAMS else "Visible slider defaults"
+    source = param_source_for_ticker(ticker) if str(ticker).upper() in PER_TICKER_PARAMS else "VISIBLE_SLIDER_DEFAULTS"
     model_version = (
         f"{str(ticker).upper()}|Institutional Trend Rail|"
         f"buf{p['buffer_pct']*100:.2f}|conf{int(p['confirm_bars'])}|"
@@ -867,7 +909,7 @@ def debug_ticker(ticker):
         lock_store = load_signal_lock()
         inst_store = load_institutional_ledger()
         return "\n".join([
-            f"<b>Streamlit True Mirror Debug — {ticker}</b>",
+            f"<b>Streamlit Exact Bundle Debug — {ticker}</b>",
             f"Production position: <b>{info['position']}</b>",
             f"Raw signal position: {info['raw_signal_position']} | Latest raw alert: {info['raw_alert']}",
             f"Price: {info['price']:.2f} | Rail: {info['rail']:.2f}",
@@ -876,6 +918,7 @@ def debug_ticker(ticker):
             f"Data: {LOOKBACK_DAYS} days, auto_adjust=False, start/end fetch, Streamlit dropna cleaning",
             f"Params: buffer={p['buffer_pct']}, confirm={p['confirm_bars']}, hold={p['min_hold_bars']}, cool={p['cooldown_bars']}",
             f"Per-ticker params: {'YES' if ticker in PER_TICKER_PARAMS else 'NO'}",
+            f"Param source: {param_source_for_ticker(ticker)}",
             f"Streamlit bundle file found: {bundle_note}",
             f"Signal-lock key loaded: {'YES' if f'{ticker}|{INTERVAL}' in lock_store else 'NO'}",
             f"Institutional ledger ticker loaded: {'YES' if ticker in inst_store else 'NO'}",
@@ -923,7 +966,7 @@ def handle_telegram_commands():
                 cash = sorted([t for t, s in positions.items() if s == "CASH"])
                 unknown = sorted([t for t, s in positions.items() if s not in ("LONG", "CASH")])
                 msg = (
-                    f"📋 <b>Main Kalman True Mirror — {fmt_ct_now()}</b>\n"
+                    f"📋 <b>Main Kalman Exact Bundle Mirror — {fmt_ct_now()}</b>\n"
                     f"Interval: <b>{INTERVAL}</b> | Visible-tab lookback: <b>{LOOKBACK_DAYS} days</b>\n"
                     f"Full scans: <b>{full_scans_completed}</b> | Params loaded: <b>{len(PER_TICKER_PARAMS)}</b>\n"
                     f"Bundle: <b>{'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}</b> | "
@@ -943,12 +986,40 @@ def handle_telegram_commands():
                 send_telegram(
                     f"<b>Streamlit state loaded</b>\n"
                     f"Bundle found: {os.path.exists(BUNDLE_FILE)}\n"
+                    f"Bundle version: {STREAMLIT_BUNDLE.get('bundle_version', 0)}\n"
                     f"Bundle exported CT: {STREAMLIT_BUNDLE.get('exported_ct','')}\n"
                     f"Per-ticker params: {len(PER_TICKER_PARAMS)}\n"
+                    f"Bundle open tickers: {len(STREAMLIT_BUNDLE.get('streamlit_open_tickers', []))}\n"
                     f"Signal-lock keys: {len(load_signal_lock())}\n"
                     f"Institutional ledger tickers: {len(load_institutional_ledger())}\n"
-                    f"Data path: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False"
+                    f"Data path: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False / prepost=False"
                 )
+
+            elif cmd == "/params":
+                summary = STREAMLIT_BUNDLE.get("sync_summary", {})
+                counts = summary.get("source_counts", {}) if isinstance(summary, dict) else {}
+                lines = [
+                    "<b>Render Parameter Sync</b>",
+                    f"Bundle version: {STREAMLIT_BUNDLE.get('bundle_version', 0)}",
+                    f"Bundle exported CT: {STREAMLIT_BUNDLE.get('exported_ct', '')}",
+                    f"Per-ticker params loaded: {len(PER_TICKER_PARAMS)}",
+                    f"Active Streamlit cache overrides: {summary.get('active_session_overrides', 0) if isinstance(summary, dict) else 0}",
+                    f"Live Streamlit captures: {summary.get('live_mirror_captures', 0) if isinstance(summary, dict) else 0}",
+                    f"Trusted saved params: {summary.get('trusted_saved_params', 0) if isinstance(summary, dict) else 0}",
+                    f"Fallback seed params: {summary.get('fallback_seed_params', 0) if isinstance(summary, dict) else 0}",
+                    f"Watchlist tickers: {len(WATCHLIST)}",
+                    f"Parameter coverage: {len(WATCHLIST) - len(MISSING_PARAM_TICKERS)}/{len(WATCHLIST)}",
+                    f"Full 150 coverage: {PARAM_COVERAGE_OK}",
+                ]
+                if MISSING_PARAM_TICKERS:
+                    lines.append("Missing params: " + ", ".join(MISSING_PARAM_TICKERS))
+                if EXTRA_PARAM_TICKERS:
+                    lines.append("Extra params: " + ", ".join(EXTRA_PARAM_TICKERS))
+                if isinstance(counts, dict) and counts:
+                    lines.append("Sources:")
+                    for k, v in sorted(counts.items()):
+                        lines.append(f"- {k}: {v}")
+                send_telegram("\n".join(lines))
 
             elif cmd == "/rescan":
                 rescan_requested = True
@@ -958,7 +1029,7 @@ def handle_telegram_commands():
                 send_telegram(f"🏓 Bot alive — {fmt_ct_now()}")
 
             elif cmd == "/help":
-                send_telegram("/status\n/why AMD\n/stateinfo\n/rescan\n/ping")
+                send_telegram("/status\n/why AMD\n/stateinfo\n/params\n/rescan\n/ping")
     except Exception as e:
         print(f"Telegram command error: {e}")
 
@@ -1032,7 +1103,7 @@ def scan_once():
                     f"Price: <b>{info['price']:.2f}</b>\n"
                     f"Rail: <b>{info['rail']:.2f}</b>\n"
                     f"Bar Time CT: <b>{info['bar_start_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
-                    f"Source: Streamlit True Mirror v14"
+                    f"Source: Streamlit Exact Bundle Mirror v16"
                 )
                 print(f"📊 {ticker}: {old_state} -> {new_state} | {transition}")
             else:
@@ -1058,19 +1129,25 @@ def scan_once():
 if __name__ == "__main__":
     seed_streamlit_state_once()
     load_state()
+    seed_positions_from_streamlit_bundle_once()
     _load_update_offset()
 
-    print("🚀 Pinehurst Main Kalman Streamlit True Mirror v14")
+    print("🚀 Pinehurst Main Kalman Streamlit Exact Bundle Mirror v16")
     print(f"Data path: {LOOKBACK_DAYS} calendar days / {INTERVAL} / auto_adjust=False")
     print(f"Params loaded: {len(PER_TICKER_PARAMS)}")
     print(f"Bundle found: {os.path.exists(BUNDLE_FILE)}")
+    print(f"Watchlist coverage: {len(WATCHLIST) - len(MISSING_PARAM_TICKERS)}/{len(WATCHLIST)} params")
+    if MISSING_PARAM_TICKERS:
+        print("MISSING PARAM TICKERS: " + ", ".join(MISSING_PARAM_TICKERS))
+    if EXTRA_PARAM_TICKERS:
+        print("EXTRA PARAM TICKERS: " + ", ".join(EXTRA_PARAM_TICKERS))
     print(f"Signal-lock keys: {len(load_signal_lock())}")
     print(f"Institutional ledger tickers: {len(load_institutional_ledger())}")
     print(f"Scan schedule: every {SCAN_EVERY_MINUTES}m + {SCAN_DELAY_SECONDS}s CT")
 
     next_scheduled_scan_ct = next_quarter_scan_time()
     send_telegram(
-        f"🚀 <b>Pinehurst Main Kalman True Mirror v14 active</b>\n"
+        f"🚀 <b>Pinehurst Main Kalman Exact Bundle Mirror v16 active</b>\n"
         f"Data: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False\n"
         f"Params: {len(PER_TICKER_PARAMS)} | Bundle: {'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}\n"
         f"Next scan: <b>{fmt_ct_dt(next_scheduled_scan_ct)}</b>"

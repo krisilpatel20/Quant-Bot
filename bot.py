@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ============================================================
-# PINEHURST MAIN KALMAN — STREAMLIT FULL 150 VERIFY v17
+# PINEHURST MAIN KALMAN — SOURCE-OF-TRUTH v18
 # ============================================================
 # This worker mirrors the uploaded Streamlit Main Kalman visible-tab production path:
 #   • live 15m Main Kalman uses 30 calendar days of data
@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 #   • same risk firewall when enabled
 #   • same non-repaint signal lock
 #   • same BacktestEngine trade accounting
-#   • same institutional append-only trade ledger
+#   • 15m-only baseline; contaminated cross-timeframe ledger is never imported
 #
 # IMPORTANT:
 # For existing Streamlit positions/history to match, upload the read-only
@@ -61,10 +61,12 @@ USE_INSTITUTIONAL_LEDGER = os.environ.get("KALMAN_INSTITUTIONAL_LIVE_LEDGER", "t
 BUNDLE_FILE = os.environ.get("STREAMLIT_KALMAN_BUNDLE_FILE", "/etc/secrets/streamlit_kalman_render_bundle.json")
 PARAMS_SECRET_FILE = os.environ.get("KALMAN_PARAMS_SECRET_FILE", "/etc/secrets/kalman_params.json")
 
-STATE_FILE = os.environ.get("STATE_FILE", "kalman_render_state_v17.json")
-SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE", "kalman_render_signal_lock_v17.json")
-INSTITUTIONAL_LEDGER_FILE = os.environ.get("INSTITUTIONAL_LEDGER_FILE", "kalman_render_institutional_ledger_v17.json")
-UPDATE_OFFSET_FILE = os.environ.get("UPDATE_OFFSET_FILE", "kalman_render_update_offset_v17.json")
+STATE_FILE = os.environ.get("STATE_FILE_V18", "kalman_render_state_v18.json")
+SIGNAL_LOCK_FILE = os.environ.get("SIGNAL_LOCK_FILE_V18", "kalman_render_signal_lock_v18.json")
+INSTITUTIONAL_LEDGER_FILE = "kalman_render_institutional_ledger_v18_UNUSED.json"
+UPDATE_OFFSET_FILE = os.environ.get("UPDATE_OFFSET_FILE_V18", "kalman_render_update_offset_v18.json")
+EXACT_PARAMS_CACHE_FILE = os.environ.get("EXACT_PARAMS_CACHE_FILE_V18", "kalman_render_exact_params_v18.json")
+RF_RATE = float(os.environ.get("KALMAN_RF_RATE", "0.04"))
 
 WATCHLIST = [
     "AAPL", "ACN", "ADI", "AEVA", "AFRM", "AI", "ALAB", "AMAT", "AMD", "AMLX", "AMPX", "AMR",
@@ -159,25 +161,57 @@ def _load_per_ticker_params():
             print(f"PER_TICKER_PARAMS_JSON parse error: {e}")
     return {}
 
-PER_TICKER_PARAMS = _load_per_ticker_params()
+BUNDLE_PARAMS = _load_per_ticker_params()
 
-# Full 150-ticker coverage verification. The worker still has a 150-name watchlist,
-# but now it explicitly reports whether every watchlist ticker has a parameter record.
-PARAM_TICKERS = set(PER_TICKER_PARAMS.keys())
-MISSING_PARAM_TICKERS = sorted(set(WATCHLIST) - PARAM_TICKERS)
-EXTRA_PARAM_TICKERS = sorted(PARAM_TICKERS - set(WATCHLIST))
-PARAM_COVERAGE_OK = (len(MISSING_PARAM_TICKERS) == 0 and len(WATCHLIST) == 150)
+TRUSTED_SYNC_SOURCES = {
+    "ACTIVE_STREAMLIT_FAST_CACHE",
+    "LIVE_STREAMLIT_USED",
+    "TRUSTED_STREAMLIT_SAVED_PARAMS",
+}
+
+def _is_trusted_bundle_param(rec):
+    if not isinstance(rec, dict):
+        return False
+    sync_source = str(rec.get("_sync_source", ""))
+    source = str(rec.get("source", ""))
+    if sync_source in TRUSTED_SYNC_SOURCES:
+        return True
+    if source == "BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M":
+        return False
+    if sync_source == "BATCH_SEED_FALLBACK":
+        return False
+    # Records without batch markers are allowed as trusted saved interactive params.
+    return bool(rec) and not sync_source
+
+TRUSTED_BUNDLE_PARAMS = {
+    t: dict(rec) for t, rec in BUNDLE_PARAMS.items() if _is_trusted_bundle_param(rec)
+}
+
+def _load_exact_params_cache():
+    data = _load_json_file(EXACT_PARAMS_CACHE_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    return {str(k).upper(): v for k, v in data.items() if isinstance(v, dict)}
+
+EXACT_PARAMS_CACHE = _load_exact_params_cache()
+
+def _save_exact_params_cache():
+    _save_json_file(EXACT_PARAMS_CACHE_FILE, EXACT_PARAMS_CACHE)
 
 def param_source_for_ticker(ticker):
-    rec = PER_TICKER_PARAMS.get(str(ticker).upper(), {})
-    if isinstance(rec, dict):
-        return str(rec.get("_sync_source", rec.get("source", "BUNDLE_OR_SAVED_PARAMS")))
-    return "DEFAULTS"
+    t = str(ticker).upper()
+    if t in TRUSTED_BUNDLE_PARAMS:
+        rec = TRUSTED_BUNDLE_PARAMS[t]
+        return str(rec.get("_sync_source", rec.get("source", "TRUSTED_STREAMLIT")))
+    if t in EXACT_PARAMS_CACHE:
+        return "EXACT_STREAMLIT_OPTIMIZER_30D_15M"
+    return "NEEDS_EXACT_OPTIMIZATION"
 
-def params_for_ticker(ticker):
-    p = dict(PARAMS)
-    override = PER_TICKER_PARAMS.get(str(ticker).upper(), {})
-    for k, v in override.items():
+def _apply_param_record(base, rec):
+    p = dict(base)
+    if not isinstance(rec, dict):
+        return p
+    for k, v in rec.items():
         if k not in p:
             continue
         try:
@@ -187,9 +221,29 @@ def params_for_ticker(ticker):
                 p[k] = int(v)
             else:
                 p[k] = float(v)
-        except Exception as e:
-            print(f"{ticker}: param override '{k}'={v!r} rejected ({e}); keeping default {p[k]}")
+        except Exception:
+            pass
     return p
+
+def params_for_ticker(ticker, px=None):
+    t = str(ticker).upper()
+    if t in TRUSTED_BUNDLE_PARAMS:
+        return _apply_param_record(PARAMS, TRUSTED_BUNDLE_PARAMS[t])
+    if t in EXACT_PARAMS_CACHE:
+        return _apply_param_record(PARAMS, EXACT_PARAMS_CACHE[t])
+    if px is not None and len(px) >= 80:
+        rec = optimize_exact_streamlit_params(t, px)
+        if isinstance(rec, dict):
+            EXACT_PARAMS_CACHE[t] = rec
+            _save_exact_params_cache()
+            return _apply_param_record(PARAMS, rec)
+    return dict(PARAMS)
+
+PARAM_TICKERS = set(BUNDLE_PARAMS.keys())
+MISSING_PARAM_TICKERS = sorted(set(WATCHLIST) - PARAM_TICKERS)
+EXTRA_PARAM_TICKERS = sorted(PARAM_TICKERS - set(WATCHLIST))
+PARAM_COVERAGE_OK = (len(MISSING_PARAM_TICKERS) == 0 and len(WATCHLIST) == 150)
+TRUSTED_PARAM_COUNT = len(TRUSTED_BUNDLE_PARAMS)
 
 positions = {ticker: "UNKNOWN" for ticker in WATCHLIST}
 last_alert_bar = {}
@@ -202,7 +256,6 @@ full_scans_completed = 0
 rescan_requested = False
 last_update_id = None
 next_scheduled_scan_ct = None
-bundle_version_applied = -1
 
 def ct_now():
     return datetime.now(ZoneInfo("America/Chicago"))
@@ -242,14 +295,14 @@ def send_telegram(text):
         return False
 
 def load_state():
-    global positions, last_alert_bar, last_checked, last_error, full_scans_completed, bundle_version_applied
+    global positions, last_alert_bar, last_checked, last_error, full_scans_completed
     data = _load_json_file(STATE_FILE, {})
     if not isinstance(data, dict):
         return
-    try:
-        bundle_version_applied = int(data.get("bundle_version_applied", -1))
-    except Exception:
-        bundle_version_applied = -1
+    if int(data.get("state_version", 0) or 0) != 18:
+        if data:
+            print("Ignoring legacy pre-v18 position state; first scan will build a clean baseline.")
+        return
     for t in WATCHLIST:
         if data.get("positions", {}).get(t) in ("LONG", "CASH", "UNKNOWN"):
             positions[t] = data["positions"][t]
@@ -266,6 +319,7 @@ def load_state():
 
 def save_state():
     _save_json_file(STATE_FILE, {
+        "state_version": 18,
         "positions": positions,
         "last_alert_bar": last_alert_bar,
         "last_checked": last_checked,
@@ -273,48 +327,20 @@ def save_state():
         "full_scans_completed": full_scans_completed,
         "scan_started_at": scan_started_at,
         "scan_finished_at": scan_finished_at,
-        "bundle_version_applied": bundle_version_applied,
     })
 
 def seed_streamlit_state_once():
-    """Seed Render's local lock/ledger from the read-only Streamlit bundle once."""
+    """Seed only 15m non-repaint locks. Never import mixed-timeframe institutional ledgers."""
     if not os.path.exists(SIGNAL_LOCK_FILE):
-        seed = STREAMLIT_BUNDLE.get("signal_lock", {})
+        raw = STREAMLIT_BUNDLE.get("signal_lock", {})
+        seed = {str(k): v for k, v in raw.items() if str(k).upper().endswith("|15M") and isinstance(v, dict)} if isinstance(raw, dict) else {}
         if seed:
             _save_json_file(SIGNAL_LOCK_FILE, seed)
-            print(f"Seeded Render signal lock from Streamlit bundle: {len(seed)} keys")
-    if not os.path.exists(INSTITUTIONAL_LEDGER_FILE):
-        seed = STREAMLIT_BUNDLE.get("institutional_ledger", {})
-        if seed:
-            _save_json_file(INSTITUTIONAL_LEDGER_FILE, seed)
-            print(f"Seeded Render institutional ledger from Streamlit bundle: {len(seed)} tickers")
+            print(f"Seeded Render 15m signal lock from Streamlit bundle: {len(seed)} keys")
 
 def seed_positions_from_streamlit_bundle_once():
-    """Baseline Render LONG/CASH from the Streamlit bundle.
-
-    Re-applies whenever the bundle's version number is newer than the one
-    already recorded in STATE_FILE, so re-uploading a fresher bundle actually
-    takes effect instead of being ignored after the first-ever run.
-    """
-    global bundle_version_applied
-    try:
-        bundle_version = STREAMLIT_BUNDLE.get("bundle_version", 0)
-        if os.path.exists(STATE_FILE) and bundle_version_applied == bundle_version:
-            return  # already applied this exact bundle version
-
-        opens = set(STREAMLIT_BUNDLE.get("streamlit_open_tickers", []))
-        if not opens:
-            return
-        for t in WATCHLIST:
-            positions[t] = "LONG" if t in opens else "CASH"
-        bundle_version_applied = bundle_version
-        save_state()
-        print(
-            f"Seeded Render positions from Streamlit bundle v{bundle_version}: "
-            f"{len(opens)} LONG / {len(WATCHLIST)-len(opens)} CASH"
-        )
-    except Exception as e:
-        print(f"Position seed error: {e}")
+    """v18 never converts an incomplete open list into 141 fake CASH states."""
+    return
 
 
 def load_signal_lock():
@@ -570,8 +596,7 @@ def apply_kalman_risk_firewall(prices, signal, trend, max_trade_loss_pct=18.0, t
     except Exception:
         return pd.Series(signal).ffill().fillna(0).clip(0, 1)
 
-def build_main_kalman_signal(px, ticker):
-    pms = params_for_ticker(ticker)
+def build_raw_signal_for_params(px, pms):
     rail, center, long_state = institutional_trend_rail(
         px,
         fast_gain=float(pms["fast_gain"]),
@@ -610,7 +635,6 @@ def build_main_kalman_signal(px, ticker):
     in_pos = False
     bars_held = 0
     cooldown_left = 0
-
     for dt in px.index:
         if cooldown_left > 0:
             cooldown_left -= 1
@@ -619,8 +643,6 @@ def build_main_kalman_signal(px, ticker):
                 in_pos = True
                 bars_held = 0
                 sig.loc[dt] = 1.0
-            else:
-                sig.loc[dt] = 0.0
         else:
             bars_held += 1
             if bars_held >= min_hold_bars and bool(exit_ready.loc[dt]):
@@ -630,9 +652,116 @@ def build_main_kalman_signal(px, ticker):
                 sig.loc[dt] = 0.0
             else:
                 sig.loc[dt] = 1.0
+    return sig.ffill().fillna(0).clip(0, 1), bt_trend
 
-    sig = sig.ffill().fillna(0).clip(0, 1)
 
+def run_strategy_full(prices, signals, initial_capital=10000.0):
+    common_idx = prices.index.intersection(signals.index)
+    prices = pd.Series(prices.loc[common_idx]).replace([np.inf, -np.inf], np.nan).dropna()
+    signals = pd.Series(signals).reindex(prices.index).ffill().fillna(0.0).astype(float).clip(0.0, 1.0)
+    if len(prices) == 0:
+        empty = pd.Series(dtype=float)
+        return {"equity_curve": empty, "returns": empty, "trades": pd.DataFrame()}
+
+    prices_arr = prices.values
+    signals_arr = signals.values
+    dates_arr = prices.index
+    equity_vals, trades = [], []
+    position = 0
+    entry_price = 0.0
+    entry_date = None
+    cash = float(initial_capital)
+    holdings = 0.0
+
+    def equity(price):
+        return float(cash + holdings * price)
+
+    for i in range(len(prices_arr)):
+        dt = dates_arr[i]
+        price = float(prices_arr[i])
+        desired = float(signals_arr[i])
+        if position == 0 and desired > 0:
+            position = 1
+            entry_price = price
+            entry_date = dt
+            holdings = cash / price
+            cash = 0.0
+        elif position == 1 and desired == 0:
+            cash += holdings * price
+            holdings = 0.0
+            trades.append({"Entry Date": entry_date, "Exit Date": dt, "Buy Price": entry_price, "Sell Price": price,
+                           "PnL (%)": ((price-entry_price)/entry_price*100.0) if entry_price else 0.0, "Status": "Closed"})
+            position = 0
+        equity_vals.append(equity(price))
+
+    if position == 1:
+        price = float(prices.iloc[-1])
+        trades.append({"Entry Date": entry_date, "Exit Date": None, "Buy Price": entry_price, "Sell Price": price,
+                       "PnL (%)": ((price-entry_price)/entry_price*100.0) if entry_price else 0.0, "Status": "Open"})
+        equity_vals[-1] = equity(price)
+
+    eq = pd.Series(equity_vals, index=prices.index, dtype=float)
+    rets = eq.pct_change().fillna(0.0)
+    return {"equity_curve": eq, "returns": rets, "trades": pd.DataFrame(trades)}
+
+
+def optimize_exact_streamlit_params(ticker, px):
+    """Exact Fast-live Streamlit grid/scoring. No batch seed is trusted here."""
+    base = dict(PARAMS)
+    bh_reference = (float(px.iloc[-1]) / float(px.iloc[0]) - 1.0) * 100.0 if len(px) else 0.0
+    best = None
+    for buf in [0.010, 0.015, 0.020, 0.030, 0.040, 0.055, 0.070]:
+        for conf in [3, 4, 5, 7, 10]:
+            for hold in [10, 15, 21, 34, 55]:
+                for cool in [5, 8, 13, 21]:
+                    p = dict(base)
+                    p.update({"buffer_pct": buf, "confirm_bars": conf, "min_hold_bars": hold, "cooldown_bars": cool})
+                    sig, trend = build_raw_signal_for_params(px, p)
+                    if USE_RISK_FIREWALL:
+                        sig = apply_kalman_risk_firewall(px, sig, trend,
+                            max_trade_loss_pct=TRADE_STOP_PCT,
+                            trail_stop_pct=TRAIL_STOP_PCT,
+                            equity_dd_stop_pct=EQUITY_DD_STOP_PCT,
+                            cooldown_bars=FIREWALL_COOLDOWN)
+                    bt = run_strategy_full(px, sig, 10000.0)
+                    eq = bt["equity_curve"]
+                    rets = bt["returns"]
+                    trades = bt["trades"]
+                    if eq is None or len(eq) < 2:
+                        continue
+                    strat = (float(eq.iloc[-1]) / 10000.0 - 1.0) * 100.0
+                    if isinstance(rets, pd.Series) and len(rets):
+                        cum = (1 + rets).cumprod()
+                        dd = (cum / cum.cummax() - 1).min() * 100.0
+                    else:
+                        dd = -99.0
+                    trade_n = 0 if trades is None or trades.empty else len(trades)
+                    if isinstance(rets, pd.Series) and len(rets) > 2:
+                        excess = rets - (RF_RATE / 252.0)
+                        sharpe = np.sqrt(252.0) * excess.mean() / (rets.std() + 1e-9)
+                    else:
+                        sharpe = 0.0
+                    dd_abs = abs(float(dd))
+                    score = (strat - bh_reference) + 0.08 * strat + 8.0 * float(sharpe) - 2.20 * dd_abs - 0.45 * max(0, trade_n - 10)
+                    if strat < bh_reference:
+                        score -= (bh_reference - strat) * 0.85
+                    if dd_abs > 35.0:
+                        score -= ((dd_abs - 35.0) ** 2) * 2.0
+                    if dd_abs > 60.0:
+                        score -= 5000.0
+                    if best is None or score > best["score"]:
+                        best = {"score": float(score), "buffer_pct": buf, "confirm_bars": conf,
+                                "min_hold_bars": hold, "cooldown_bars": cool,
+                                "slope_confirm": bool(base["slope_confirm"]), "atr_safety": bool(base["atr_safety"]),
+                                "source": "EXACT_STREAMLIT_OPTIMIZER_30D_15M", "saved_ct": fmt_ct_now()}
+    if best is not None:
+        print(f"🎯 {ticker}: exact optimize -> buf={best['buffer_pct']*100:.2f}% conf={best['confirm_bars']} hold={best['min_hold_bars']} cool={best['cooldown_bars']}")
+    return best
+
+
+def build_main_kalman_signal(px, ticker):
+    pms = params_for_ticker(ticker, px=px)
+    sig, bt_trend = build_raw_signal_for_params(px, pms)
     if USE_RISK_FIREWALL:
         sig = apply_kalman_risk_firewall(
             px, sig, bt_trend,
@@ -641,8 +770,7 @@ def build_main_kalman_signal(px, ticker):
             equity_dd_stop_pct=EQUITY_DD_STOP_PCT,
             cooldown_bars=FIREWALL_COOLDOWN,
         )
-
-    sig = apply_signal_lock(ticker, sig, interval=INTERVAL)
+    sig = apply_signal_lock(ticker, sig, interval="15m")
     return sig, bt_trend
 
 # ============================================================
@@ -723,7 +851,7 @@ def _safe_str_dt(v):
 
 def settings_for_institutional_ledger(ticker):
     p = params_for_ticker(ticker)
-    source = param_source_for_ticker(ticker) if str(ticker).upper() in PER_TICKER_PARAMS else "VISIBLE_SLIDER_DEFAULTS"
+    source = param_source_for_ticker(ticker)
     model_version = (
         f"{str(ticker).upper()}|Institutional Trend Rail|"
         f"buf{p['buffer_pct']*100:.2f}|conf{int(p['confirm_bars'])}|"
@@ -888,61 +1016,56 @@ def latest_kalman_state(ticker):
     raw_alert = "BUY" if latest_sig == 1 and prev_sig == 0 else "SELL" if latest_sig == 0 and prev_sig == 1 else "NO NEW ALERT"
 
     candidate_trades = run_strategy(px, sig)
-    settings = settings_for_institutional_ledger(ticker)
-    production_trades = apply_institutional_trade_ledger(ticker, candidate_trades, px, settings)
-
-    if isinstance(production_trades, pd.DataFrame) and not production_trades.empty:
-        is_open = _trade_row_is_open(production_trades.iloc[-1], columns=production_trades.columns)
+    if isinstance(candidate_trades, pd.DataFrame) and not candidate_trades.empty:
+        is_open = _trade_row_is_open(candidate_trades.iloc[-1], columns=candidate_trades.columns)
         position = "LONG" if is_open else "CASH"
-        last_trade = production_trades.iloc[-1].to_dict()
+        last_trade = candidate_trades.iloc[-1].to_dict()
     else:
         position = "LONG" if latest_sig == 1 else "CASH"
         last_trade = None
 
     last_start = pd.Timestamp(px.index[-1])
-    interval_minutes = 15 if INTERVAL == "15m" else 5 if INTERVAL == "5m" else 30 if INTERVAL == "30m" else 60
-    candle_close = last_start + pd.Timedelta(minutes=interval_minutes)
-
+    candle_close = last_start + pd.Timedelta(minutes=15)
+    pms = params_for_ticker(ticker, px=px)
     return {
         "ticker": str(ticker).upper(),
         "position": position,
-        "raw_alert": raw_alert,
         "raw_signal_position": "LONG" if latest_sig == 1 else "CASH",
+        "raw_alert": raw_alert,
         "price": float(px.iloc[-1]),
         "rail": float(rail_s.iloc[-1]),
         "bar_start_ct": last_start,
         "candle_close_ct": candle_close,
+        "params": pms,
+        "param_source": param_source_for_ticker(ticker),
         "last_trade": last_trade,
-        "params_source": "CUSTOM" if str(ticker).upper() in PER_TICKER_PARAMS else "DEFAULT",
     }
 
+
 def debug_ticker(ticker):
-    ticker = str(ticker).upper().strip()
+    t = str(ticker or "").strip().upper()
+    if t not in WATCHLIST:
+        return f"Ticker not in 150-name watchlist: {t or 'blank'}"
     try:
-        info = latest_kalman_state(ticker)
+        info = latest_kalman_state(t)
         if info is None:
-            return f"⚠️ {ticker}: no data."
-        p = params_for_ticker(ticker)
-        bundle_note = "YES" if os.path.exists(BUNDLE_FILE) else "NO"
-        lock_store = load_signal_lock()
-        inst_store = load_institutional_ledger()
-        return "\n".join([
-            f"<b>Streamlit Exact Bundle Debug — {ticker}</b>",
-            f"Production position: <b>{info['position']}</b>",
-            f"Raw signal position: {info['raw_signal_position']} | Latest raw alert: {info['raw_alert']}",
-            f"Price: {info['price']:.2f} | Rail: {info['rail']:.2f}",
-            f"Latest bar start CT: {info['bar_start_ct'].strftime('%Y-%m-%d %I:%M %p CT')}",
-            f"Displayed candle close CT: {info['candle_close_ct'].strftime('%Y-%m-%d %I:%M %p CT')}",
-            f"Data: {LOOKBACK_DAYS} days, auto_adjust=False, start/end fetch, Streamlit dropna cleaning",
-            f"Params: buffer={p['buffer_pct']}, confirm={p['confirm_bars']}, hold={p['min_hold_bars']}, cool={p['cooldown_bars']}",
-            f"Per-ticker params: {'YES' if ticker in PER_TICKER_PARAMS else 'NO'}",
-            f"Param source: {param_source_for_ticker(ticker)}",
-            f"Streamlit bundle file found: {bundle_note}",
-            f"Signal-lock key loaded: {'YES' if f'{ticker}|{INTERVAL}' in lock_store else 'NO'}",
-            f"Institutional ledger ticker loaded: {'YES' if ticker in inst_store else 'NO'}",
-        ])
+            return f"⚠️ {t}: no usable 30d/15m data"
+        pms = info["params"]
+        last_trade = info.get("last_trade") or {}
+        return (
+            f"<b>v18 Source-of-Truth Debug — {t}</b>\n"
+            f"Position: <b>{info['position']}</b> | Raw signal: <b>{info['raw_signal_position']}</b>\n"
+            f"Param source: <b>{info['param_source']}</b>\n"
+            f"Params: buffer=<b>{pms['buffer_pct']:.4f}</b>, confirm=<b>{pms['confirm_bars']}</b>, "
+            f"hold=<b>{pms['min_hold_bars']}</b>, cool=<b>{pms['cooldown_bars']}</b>\n"
+            f"Price: <b>{info['price']:.2f}</b> | Rail: <b>{info['rail']:.2f}</b>\n"
+            f"Latest completed candle CT: <b>{info['candle_close_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
+            f"Last trade status: <b>{last_trade.get('Status', 'None')}</b> | Entry: <b>{last_trade.get('Entry Date', '')}</b>\n"
+            "Institutional ledger import: <b>OFF</b> (prevents daily/15m mixing)"
+        )
     except Exception as e:
-        return f"⚠️ {ticker} debug error: {e}"
+        return f"⚠️ {t} debug error: {e}"
+
 
 # ============================================================
 # TELEGRAM COMMANDS
@@ -984,11 +1107,11 @@ def handle_telegram_commands():
                 cash = sorted([t for t, s in positions.items() if s == "CASH"])
                 unknown = sorted([t for t, s in positions.items() if s not in ("LONG", "CASH")])
                 msg = (
-                    f"📋 <b>Main Kalman Exact Bundle Mirror — {fmt_ct_now()}</b>\n"
+                    f"📋 <b>Main Kalman Source-of-Truth v18 — {fmt_ct_now()}</b>\n"
                     f"Interval: <b>{INTERVAL}</b> | Visible-tab lookback: <b>{LOOKBACK_DAYS} days</b>\n"
-                    f"Full scans: <b>{full_scans_completed}</b> | Params loaded: <b>{len(PER_TICKER_PARAMS)}</b>\n"
+                    f"Full scans: <b>{full_scans_completed}</b> | Params loaded: <b>{len(BUNDLE_PARAMS)}</b>\n"
                     f"Bundle: <b>{'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}</b> | "
-                    f"Signal-lock keys: <b>{len(load_signal_lock())}</b> | Ledger tickers: <b>{len(load_institutional_ledger())}</b>\n"
+                    f"15m signal-lock keys: <b>{len(load_signal_lock())}</b> | Institutional ledger: <b>OFF</b>\n"
                     f"{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN\n\n"
                     + "<b>LONG</b>\n" + ("".join([f"🟢 {t}\n" for t in longs]) if longs else "None\n")
                     + "\n<b>CASH</b>\n" + ("".join([f"⚪ {t}\n" for t in cash]) if cash else "None\n")
@@ -1006,10 +1129,10 @@ def handle_telegram_commands():
                     f"Bundle found: {os.path.exists(BUNDLE_FILE)}\n"
                     f"Bundle version: {STREAMLIT_BUNDLE.get('bundle_version', 0)}\n"
                     f"Bundle exported CT: {STREAMLIT_BUNDLE.get('exported_ct','')}\n"
-                    f"Per-ticker params: {len(PER_TICKER_PARAMS)}\n"
+                    f"Per-ticker params: {len(BUNDLE_PARAMS)}\n"
                     f"Bundle open tickers: {len(STREAMLIT_BUNDLE.get('streamlit_open_tickers', []))}\n"
                     f"Signal-lock keys: {len(load_signal_lock())}\n"
-                    f"Institutional ledger tickers: {len(load_institutional_ledger())}\n"
+                    f"Institutional ledger imported: 0 (disabled in v18)\n"
                     f"Data path: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False / prepost=False"
                 )
 
@@ -1017,17 +1140,14 @@ def handle_telegram_commands():
                 summary = STREAMLIT_BUNDLE.get("sync_summary", {})
                 counts = summary.get("source_counts", {}) if isinstance(summary, dict) else {}
                 lines = [
-                    "<b>Render Parameter Sync</b>",
+                    "<b>v18 Parameter Sources</b>",
                     f"Bundle version: {STREAMLIT_BUNDLE.get('bundle_version', 0)}",
-                    f"Bundle exported CT: {STREAMLIT_BUNDLE.get('exported_ct', '')}",
-                    f"Per-ticker params loaded: {len(PER_TICKER_PARAMS)}",
-                    f"Active Streamlit cache overrides: {summary.get('active_session_overrides', 0) if isinstance(summary, dict) else 0}",
-                    f"Live Streamlit captures: {summary.get('live_mirror_captures', 0) if isinstance(summary, dict) else 0}",
-                    f"Trusted saved params: {summary.get('trusted_saved_params', 0) if isinstance(summary, dict) else 0}",
-                    f"Fallback seed params: {summary.get('fallback_seed_params', 0) if isinstance(summary, dict) else 0}",
-                    f"Watchlist tickers: {len(WATCHLIST)}",
-                    f"Parameter coverage: {len(WATCHLIST) - len(MISSING_PARAM_TICKERS)}/{len(WATCHLIST)}",
-                    f"Full 150 coverage: {PARAM_COVERAGE_OK}",
+                    f"Bundle records present: {len(BUNDLE_PARAMS)}/150",
+                    f"Trusted live Streamlit records: {len(TRUSTED_BUNDLE_PARAMS)}",
+                    f"Stale batch records ignored: {len([1 for r in BUNDLE_PARAMS.values() if isinstance(r, dict) and (str(r.get('_sync_source','')) == 'BATCH_SEED_FALLBACK' or str(r.get('source','')) == 'BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M')])}",
+                    f"Exact Streamlit optimizer cache: {len(EXACT_PARAMS_CACHE)}",
+                    f"Current states: {len([1 for s in positions.values() if s in ('LONG','CASH')])}/150 baselined",
+                    "Institutional ledger import: OFF",
                 ]
                 if MISSING_PARAM_TICKERS:
                     lines.append("Missing params: " + ", ".join(MISSING_PARAM_TICKERS))
@@ -1082,6 +1202,7 @@ def scan_once():
     scan_in_progress = True
     scan_started_at = fmt_ct_now()
     handle_telegram_commands()
+    baseline_mode = (full_scans_completed == 0)
 
     for ticker in WATCHLIST:
         try:
@@ -1102,13 +1223,11 @@ def scan_once():
             last_error.pop(ticker, None)
 
             transition = "NO NEW ALERT"
-            if old_state == "CASH" and new_state == "LONG":
-                transition = "BUY"
-            elif old_state == "LONG" and new_state == "CASH":
-                transition = "SELL"
-            elif old_state == "UNKNOWN" and raw_alert in ("BUY", "SELL"):
-                if (raw_alert == "BUY" and new_state == "LONG") or (raw_alert == "SELL" and new_state == "CASH"):
-                    transition = raw_alert
+            if not baseline_mode:
+                if old_state == "CASH" and new_state == "LONG":
+                    transition = "BUY"
+                elif old_state == "LONG" and new_state == "CASH":
+                    transition = "SELL"
 
             bar_key = f"{ticker}|{transition}|{info['bar_start_ct'].strftime('%Y-%m-%d %H:%M:%S')}"
             if transition in ("BUY", "SELL") and last_alert_bar.get(ticker) != bar_key:
@@ -1121,7 +1240,7 @@ def scan_once():
                     f"Price: <b>{info['price']:.2f}</b>\n"
                     f"Rail: <b>{info['rail']:.2f}</b>\n"
                     f"Bar Time CT: <b>{info['bar_start_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
-                    f"Source: Streamlit Exact Bundle Mirror v17"
+                    f"Source: Streamlit Source-of-Truth v18"
                 )
                 print(f"📊 {ticker}: {old_state} -> {new_state} | {transition}")
             else:
@@ -1141,33 +1260,47 @@ def scan_once():
 
     scan_in_progress = False
     scan_finished_at = fmt_ct_now()
+    was_baseline = (full_scans_completed == 0)
     full_scans_completed += 1
     save_state()
+    if was_baseline:
+        longs = sorted([t for t, s in positions.items() if s == "LONG"])
+        cash = sorted([t for t, s in positions.items() if s == "CASH"])
+        unknown = sorted([t for t, s in positions.items() if s == "UNKNOWN"])
+        send_telegram(
+            f"✅ <b>v18 exact 15m baseline complete</b>\n"
+            f"150-ticker scan: <b>{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN</b>\n"
+            f"Trusted Streamlit params: <b>{len(TRUSTED_BUNDLE_PARAMS)}</b>\n"
+            f"Exact optimizer cache: <b>{len(EXACT_PARAMS_CACHE)}</b>\n"
+            "No BUY/SELL alerts were sent during baseline."
+        )
 
 if __name__ == "__main__":
     seed_streamlit_state_once()
     load_state()
-    seed_positions_from_streamlit_bundle_once()
+    # v18 positions stay UNKNOWN until the first exact 150-ticker baseline scan.
     _load_update_offset()
 
-    print("🚀 Pinehurst Main Kalman Streamlit Exact Bundle Mirror v17")
+    print("🚀 Pinehurst Main Kalman Source-of-Truth v18")
     print(f"Data path: {LOOKBACK_DAYS} calendar days / {INTERVAL} / auto_adjust=False")
-    print(f"Params loaded: {len(PER_TICKER_PARAMS)}")
+    print(f"Bundle params loaded: {len(BUNDLE_PARAMS)}")
     print(f"Bundle found: {os.path.exists(BUNDLE_FILE)}")
-    print(f"Watchlist coverage: {len(WATCHLIST) - len(MISSING_PARAM_TICKERS)}/{len(WATCHLIST)} params")
+    print(f"Bundle records present: {len(WATCHLIST) - len(MISSING_PARAM_TICKERS)}/{len(WATCHLIST)}")
+    print(f"Trusted live Streamlit params: {len(TRUSTED_BUNDLE_PARAMS)}")
+    print(f"Exact optimizer cache: {len(EXACT_PARAMS_CACHE)}")
     if MISSING_PARAM_TICKERS:
         print("MISSING PARAM TICKERS: " + ", ".join(MISSING_PARAM_TICKERS))
     if EXTRA_PARAM_TICKERS:
         print("EXTRA PARAM TICKERS: " + ", ".join(EXTRA_PARAM_TICKERS))
     print(f"Signal-lock keys: {len(load_signal_lock())}")
-    print(f"Institutional ledger tickers: {len(load_institutional_ledger())}")
+    print("Institutional ledger import: OFF (daily/15m contamination blocked)")
     print(f"Scan schedule: every {SCAN_EVERY_MINUTES}m + {SCAN_DELAY_SECONDS}s CT")
 
     next_scheduled_scan_ct = next_quarter_scan_time()
     send_telegram(
-        f"🚀 <b>Pinehurst Main Kalman Exact Bundle Mirror v17 active</b>\n"
+        f"🚀 <b>Pinehurst Main Kalman Source-of-Truth v18 active</b>\n"
         f"Data: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False\n"
-        f"Params: {len(PER_TICKER_PARAMS)} | Bundle: {'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}\n"
+        f"Trusted params: {len(TRUSTED_BUNDLE_PARAMS)} | Exact cache: {len(EXACT_PARAMS_CACHE)} | Bundle: {'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}\n"
         f"Next scan: <b>{fmt_ct_dt(next_scheduled_scan_ct)}</b>"
     )
 

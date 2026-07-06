@@ -187,8 +187,8 @@ def params_for_ticker(ticker):
                 p[k] = int(v)
             else:
                 p[k] = float(v)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"{ticker}: param override '{k}'={v!r} rejected ({e}); keeping default {p[k]}")
     return p
 
 positions = {ticker: "UNKNOWN" for ticker in WATCHLIST}
@@ -202,6 +202,7 @@ full_scans_completed = 0
 rescan_requested = False
 last_update_id = None
 next_scheduled_scan_ct = None
+bundle_version_applied = -1
 
 def ct_now():
     return datetime.now(ZoneInfo("America/Chicago"))
@@ -241,10 +242,14 @@ def send_telegram(text):
         return False
 
 def load_state():
-    global positions, last_alert_bar, last_checked, last_error, full_scans_completed
+    global positions, last_alert_bar, last_checked, last_error, full_scans_completed, bundle_version_applied
     data = _load_json_file(STATE_FILE, {})
     if not isinstance(data, dict):
         return
+    try:
+        bundle_version_applied = int(data.get("bundle_version_applied", -1))
+    except Exception:
+        bundle_version_applied = -1
     for t in WATCHLIST:
         if data.get("positions", {}).get(t) in ("LONG", "CASH", "UNKNOWN"):
             positions[t] = data["positions"][t]
@@ -268,6 +273,7 @@ def save_state():
         "full_scans_completed": full_scans_completed,
         "scan_started_at": scan_started_at,
         "scan_finished_at": scan_finished_at,
+        "bundle_version_applied": bundle_version_applied,
     })
 
 def seed_streamlit_state_once():
@@ -284,17 +290,29 @@ def seed_streamlit_state_once():
             print(f"Seeded Render institutional ledger from Streamlit bundle: {len(seed)} tickers")
 
 def seed_positions_from_streamlit_bundle_once():
-    """Baseline Render LONG/CASH from the exact Streamlit bundle on a fresh v16 state file."""
+    """Baseline Render LONG/CASH from the Streamlit bundle.
+
+    Re-applies whenever the bundle's version number is newer than the one
+    already recorded in STATE_FILE, so re-uploading a fresher bundle actually
+    takes effect instead of being ignored after the first-ever run.
+    """
+    global bundle_version_applied
     try:
-        if os.path.exists(STATE_FILE):
-            return
+        bundle_version = STREAMLIT_BUNDLE.get("bundle_version", 0)
+        if os.path.exists(STATE_FILE) and bundle_version_applied == bundle_version:
+            return  # already applied this exact bundle version
+
         opens = set(STREAMLIT_BUNDLE.get("streamlit_open_tickers", []))
         if not opens:
             return
         for t in WATCHLIST:
             positions[t] = "LONG" if t in opens else "CASH"
+        bundle_version_applied = bundle_version
         save_state()
-        print(f"Seeded Render positions from Streamlit bundle: {len(opens)} LONG / {len(WATCHLIST)-len(opens)} CASH")
+        print(
+            f"Seeded Render positions from Streamlit bundle v{bundle_version}: "
+            f"{len(opens)} LONG / {len(WATCHLIST)-len(opens)} CASH"
+        )
     except Exception as e:
         print(f"Position seed error: {e}")
 
@@ -1103,7 +1121,7 @@ def scan_once():
                     f"Price: <b>{info['price']:.2f}</b>\n"
                     f"Rail: <b>{info['rail']:.2f}</b>\n"
                     f"Bar Time CT: <b>{info['bar_start_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
-                    f"Source: Streamlit Exact Bundle Mirror v16"
+                    f"Source: Streamlit Exact Bundle Mirror v17"
                 )
                 print(f"📊 {ticker}: {old_state} -> {new_state} | {transition}")
             else:
@@ -1132,7 +1150,7 @@ if __name__ == "__main__":
     seed_positions_from_streamlit_bundle_once()
     _load_update_offset()
 
-    print("🚀 Pinehurst Main Kalman Streamlit Exact Bundle Mirror v16")
+    print("🚀 Pinehurst Main Kalman Streamlit Exact Bundle Mirror v17")
     print(f"Data path: {LOOKBACK_DAYS} calendar days / {INTERVAL} / auto_adjust=False")
     print(f"Params loaded: {len(PER_TICKER_PARAMS)}")
     print(f"Bundle found: {os.path.exists(BUNDLE_FILE)}")
@@ -1147,7 +1165,7 @@ if __name__ == "__main__":
 
     next_scheduled_scan_ct = next_quarter_scan_time()
     send_telegram(
-        f"🚀 <b>Pinehurst Main Kalman Exact Bundle Mirror v16 active</b>\n"
+        f"🚀 <b>Pinehurst Main Kalman Exact Bundle Mirror v17 active</b>\n"
         f"Data: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False\n"
         f"Params: {len(PER_TICKER_PARAMS)} | Bundle: {'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}\n"
         f"Next scan: <b>{fmt_ct_dt(next_scheduled_scan_ct)}</b>"

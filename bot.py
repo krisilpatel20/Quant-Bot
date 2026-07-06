@@ -41,21 +41,48 @@ PARAMS = {
     "atr_safety": os.environ.get("KALMAN_ATR_SAFETY", "true").lower() == "true",
 }
 
-# Optional: paste/export Streamlit's saved per-ticker optimized params here through Render env.
-# Example Render env PER_TICKER_PARAMS_JSON:
-# {"PLTR":{"buffer_pct":0.02,"confirm_bars":4,"min_hold_bars":8,"cooldown_bars":3}}
+# Per-ticker optimized parameters. Preferred production method: Render Secret File.
+# Upload the combined JSON as a secret file named kalman_params.json.
+# Render exposes it at /etc/secrets/kalman_params.json.
+# Optional override env: PER_TICKER_PARAMS_FILE=/etc/secrets/your_name.json
+# Fallback: PER_TICKER_PARAMS_JSON can still contain pasted JSON text.
+PER_TICKER_PARAMS_FILE = os.environ.get(
+    "PER_TICKER_PARAMS_FILE",
+    "/etc/secrets/kalman_params.json",
+).strip()
+
+def _normalize_per_ticker_params(data):
+    if not isinstance(data, dict):
+        return {}
+    return {str(k).upper(): v for k, v in data.items() if isinstance(v, dict)}
+
 def _load_per_ticker_params():
+    # 1) Preferred: full JSON secret file
+    if PER_TICKER_PARAMS_FILE and os.path.exists(PER_TICKER_PARAMS_FILE):
+        try:
+            with open(PER_TICKER_PARAMS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            params = _normalize_per_ticker_params(data)
+            print(
+                f"Loaded {len(params)} per-ticker Kalman parameter sets "
+                f"from {PER_TICKER_PARAMS_FILE}"
+            )
+            return params
+        except Exception as e:
+            print(f"Per-ticker params file parse error ({PER_TICKER_PARAMS_FILE}): {e}")
+
+    # 2) Fallback: pasted JSON environment variable
     raw = os.environ.get("PER_TICKER_PARAMS_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return {}
-        return {str(k).upper(): v for k, v in data.items() if isinstance(v, dict)}
-    except Exception as e:
-        print(f"PER_TICKER_PARAMS_JSON parse error: {e}")
-        return {}
+    if raw:
+        try:
+            params = _normalize_per_ticker_params(json.loads(raw))
+            print(f"Loaded {len(params)} per-ticker Kalman parameter sets from PER_TICKER_PARAMS_JSON")
+            return params
+        except Exception as e:
+            print(f"PER_TICKER_PARAMS_JSON parse error: {e}")
+
+    print("Loaded 0 per-ticker Kalman parameter sets; using global defaults.")
+    return {}
 
 PER_TICKER_PARAMS = _load_per_ticker_params()
 

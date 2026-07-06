@@ -5,15 +5,27 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ============================================================
-# PINEHURST MAIN KALMAN — SOURCE-OF-TRUTH v18 (THREADED BOT)
+# PINEHURST MAIN KALMAN — SOURCE-OF-TRUTH v18
 # ============================================================
-# Splitted polling architecture: Telegram commands run on a dedicated 
-# background thread to guarantee instantaneous responses at any time.
+# This worker mirrors the uploaded Streamlit Main Kalman visible-tab production path:
+#   • live 15m Main Kalman uses 30 calendar days of data
+#   • yfinance auto_adjust=False
+#   • same CT timezone conversion and dropna cleaning
+#   • same adaptive Kalman + institutional trend rail
+#   • same per-ticker optimized params
+#   • same risk firewall when enabled
+#   • same non-repaint signal lock
+#   • same BacktestEngine trade accounting
+#   • 15m-only baseline; contaminated cross-timeframe ledger is never imported
+#
+# IMPORTANT:
+# For existing Streamlit positions/history to match, upload the read-only
+# Streamlit state bundle as a Render Secret File:
+#   /etc/secrets/streamlit_kalman_render_bundle.json
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
@@ -24,6 +36,7 @@ SCAN_EVERY_MINUTES = int(os.environ.get("SCAN_EVERY_MINUTES", "15"))
 SCAN_DELAY_SECONDS = int(os.environ.get("SCAN_DELAY_SECONDS", "30"))
 SLEEP_BETWEEN_TICKERS_SEC = float(os.environ.get("SLEEP_BETWEEN_TICKERS_SEC", "0.35"))
 
+# Streamlit visible-tab defaults.
 PARAMS = {
     "fast_gain": float(os.environ.get("KALMAN_FAST_GAIN", "0.34")),
     "slow_gain": float(os.environ.get("KALMAN_SLOW_GAIN", "0.055")),
@@ -70,9 +83,6 @@ WATCHLIST = [
     "T", "TOST", "TPR", "TRI", "TSLA", "UA", "UAL", "UBER", "UFPT", "ULTA", "UNH", "UPST",
     "V", "VST", "WING", "WMT", "WULF", "XYZ"
 ]
-
-# Thread safety lock for filesystem persistence state
-state_lock = threading.Lock()
 
 def _load_json_file(path, default=None):
     default = {} if default is None else default
@@ -130,12 +140,17 @@ def load_streamlit_bundle():
 STREAMLIT_BUNDLE = load_streamlit_bundle()
 
 def _load_per_ticker_params():
+    # Priority 1: full Streamlit bundle.
     from_bundle = STREAMLIT_BUNDLE.get("per_ticker_params", {})
     if from_bundle:
         return dict(from_bundle)
+
+    # Priority 2: params-only Render secret file.
     data = _load_json_file(PARAMS_SECRET_FILE, {})
     if isinstance(data, dict) and data:
         return {str(k).upper(): v for k, v in data.items() if isinstance(v, dict)}
+
+    # Priority 3: old env JSON.
     raw = os.environ.get("PER_TICKER_PARAMS_JSON", "").strip()
     if raw:
         try:
@@ -165,6 +180,7 @@ def _is_trusted_bundle_param(rec):
         return False
     if sync_source == "BATCH_SEED_FALLBACK":
         return False
+    # Records without batch markers are allowed as trusted saved interactive params.
     return bool(rec) and not sync_source
 
 TRUSTED_BUNDLE_PARAMS = {
@@ -180,8 +196,7 @@ def _load_exact_params_cache():
 EXACT_PARAMS_CACHE = _load_exact_params_cache()
 
 def _save_exact_params_cache():
-    with state_lock:
-        _save_json_file(EXACT_PARAMS_CACHE_FILE, EXACT_PARAMS_CACHE)
+    _save_json_file(EXACT_PARAMS_CACHE_FILE, EXACT_PARAMS_CACHE)
 
 def param_source_for_ticker(ticker):
     t = str(ticker).upper()
@@ -219,8 +234,7 @@ def params_for_ticker(ticker, px=None):
     if px is not None and len(px) >= 80:
         rec = optimize_exact_streamlit_params(t, px)
         if isinstance(rec, dict):
-            with state_lock:
-                EXACT_PARAMS_CACHE[t] = rec
+            EXACT_PARAMS_CACHE[t] = rec
             _save_exact_params_cache()
             return _apply_param_record(PARAMS, rec)
     return dict(PARAMS)
@@ -256,6 +270,7 @@ def fmt_ct_dt(dt):
 
 def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram disabled: BOT_TOKEN or CHAT_ID missing")
         return False
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -285,6 +300,8 @@ def load_state():
     if not isinstance(data, dict):
         return
     if int(data.get("state_version", 0) or 0) != 18:
+        if data:
+            print("Ignoring legacy pre-v18 position state; first scan will build a clean baseline.")
         return
     for t in WATCHLIST:
         if data.get("positions", {}).get(t) in ("LONG", "CASH", "UNKNOWN"):
@@ -301,31 +318,36 @@ def load_state():
         full_scans_completed = 0
 
 def save_state():
-    with state_lock:
-        _save_json_file(STATE_FILE, {
-            "state_version": 18,
-            "positions": positions,
-            "last_alert_bar": last_alert_bar,
-            "last_checked": last_checked,
-            "last_error": last_error,
-            "full_scans_completed": full_scans_completed,
-            "scan_started_at": scan_started_at,
-            "scan_finished_at": scan_finished_at,
-        })
+    _save_json_file(STATE_FILE, {
+        "state_version": 18,
+        "positions": positions,
+        "last_alert_bar": last_alert_bar,
+        "last_checked": last_checked,
+        "last_error": last_error,
+        "full_scans_completed": full_scans_completed,
+        "scan_started_at": scan_started_at,
+        "scan_finished_at": scan_finished_at,
+    })
 
 def seed_streamlit_state_once():
+    """Seed only 15m non-repaint locks. Never import mixed-timeframe institutional ledgers."""
     if not os.path.exists(SIGNAL_LOCK_FILE):
         raw = STREAMLIT_BUNDLE.get("signal_lock", {})
         seed = {str(k): v for k, v in raw.items() if str(k).upper().endswith("|15M") and isinstance(v, dict)} if isinstance(raw, dict) else {}
         if seed:
             _save_json_file(SIGNAL_LOCK_FILE, seed)
+            print(f"Seeded Render 15m signal lock from Streamlit bundle: {len(seed)} keys")
+
+def seed_positions_from_streamlit_bundle_once():
+    """v18 never converts an incomplete open list into 141 fake CASH states."""
+    return
+
 
 def load_signal_lock():
     return _load_json_file(SIGNAL_LOCK_FILE, {})
 
 def save_signal_lock(data):
-    with state_lock:
-        _save_json_file(SIGNAL_LOCK_FILE, data)
+    _save_json_file(SIGNAL_LOCK_FILE, data)
 
 def apply_signal_lock(ticker, sig, interval=None):
     try:
@@ -359,9 +381,11 @@ def load_institutional_ledger():
     return _load_json_file(INSTITUTIONAL_LEDGER_FILE, {})
 
 def save_institutional_ledger(data):
-    with state_lock:
-        return _save_json_file(INSTITUTIONAL_LEDGER_FILE, data)
+    return _save_json_file(INSTITUTIONAL_LEDGER_FILE, data)
 
+# ============================================================
+# EXACT STREAMLIT DATA PATH
+# ============================================================
 def _flatten_yfinance_columns(df, ticker=""):
     if isinstance(df.columns, pd.MultiIndex):
         try:
@@ -372,6 +396,14 @@ def _flatten_yfinance_columns(df, ticker=""):
     return df
 
 def fetch_streamlit_visible_tab_prices(ticker):
+    """
+    Mirrors the uploaded Streamlit visible 15m tab:
+      now_rounded - 30 calendar days -> now_rounded
+      auto_adjust=False
+      prepost=False
+      CT timezone normalization
+      add Returns/Log_Returns then dropna()
+    """
     try:
         now_rounded = ct_now().replace(second=0, microsecond=0, tzinfo=None)
         start = now_rounded - timedelta(days=LOOKBACK_DAYS)
@@ -414,8 +446,12 @@ def fetch_streamlit_visible_tab_prices(ticker):
         px = pd.Series(df["Close"]).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
         return px if len(px) >= 80 else None
     except Exception as e:
+        print(f"{ticker} data error: {e}")
         return None
 
+# ============================================================
+# EXACT STREAMLIT KALMAN / RAIL
+# ============================================================
 def institutional_adaptive_kalman_trend(prices, fast_gain=0.34, slow_gain=0.055, vol_window=20, polish_span=3):
     try:
         px = pd.Series(prices).astype(float).replace([np.inf, -np.inf], np.nan).ffill().bfill()
@@ -618,6 +654,7 @@ def build_raw_signal_for_params(px, pms):
                 sig.loc[dt] = 1.0
     return sig.ffill().fillna(0).clip(0, 1), bt_trend
 
+
 def run_strategy_full(prices, signals, initial_capital=10000.0):
     common_idx = prices.index.intersection(signals.index)
     prices = pd.Series(prices.loc[common_idx]).replace([np.inf, -np.inf], np.nan).dropna()
@@ -667,7 +704,9 @@ def run_strategy_full(prices, signals, initial_capital=10000.0):
     rets = eq.pct_change().fillna(0.0)
     return {"equity_curve": eq, "returns": rets, "trades": pd.DataFrame(trades)}
 
+
 def optimize_exact_streamlit_params(ticker, px):
+    """Exact Fast-live Streamlit grid/scoring. No batch seed is trusted here."""
     base = dict(PARAMS)
     bh_reference = (float(px.iloc[-1]) / float(px.iloc[0]) - 1.0) * 100.0 if len(px) else 0.0
     best = None
@@ -715,7 +754,10 @@ def optimize_exact_streamlit_params(ticker, px):
                                 "min_hold_bars": hold, "cooldown_bars": cool,
                                 "slope_confirm": bool(base["slope_confirm"]), "atr_safety": bool(base["atr_safety"]),
                                 "source": "EXACT_STREAMLIT_OPTIMIZER_30D_15M", "saved_ct": fmt_ct_now()}
+    if best is not None:
+        print(f"🎯 {ticker}: exact optimize -> buf={best['buffer_pct']*100:.2f}% conf={best['confirm_bars']} hold={best['min_hold_bars']} cool={best['cooldown_bars']}")
     return best
+
 
 def build_main_kalman_signal(px, ticker):
     pms = params_for_ticker(ticker, px=px)
@@ -731,6 +773,9 @@ def build_main_kalman_signal(px, ticker):
     sig = apply_signal_lock(ticker, sig, interval="15m")
     return sig, bt_trend
 
+# ============================================================
+# EXACT STREAMLIT BACKTEST TRADE ACCOUNTING
+# ============================================================
 def run_strategy(prices, signals, initial_capital=10000.0):
     common_idx = prices.index.intersection(signals.index)
     prices = pd.Series(prices.loc[common_idx]).replace([np.inf, -np.inf], np.nan).dropna()
@@ -776,6 +821,159 @@ def run_strategy(prices, signals, initial_capital=10000.0):
             "Status": "Open",
         })
     return pd.DataFrame(trades)
+
+def _safe_float_or_none(v):
+    try:
+        if v is None:
+            return None
+        vv = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+        if pd.isna(vv):
+            return None
+        return float(vv)
+    except Exception:
+        return None
+
+def _safe_str_dt(v):
+    try:
+        if v is None or (pd.isna(v) if np.isscalar(v) else False):
+            return ""
+    except Exception:
+        pass
+    try:
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "none", "nat"):
+            return ""
+        if s.lower() == "open":
+            return "Open"
+        return pd.Timestamp(v).strftime("%Y-%m-%d %H:%M:%S CT")
+    except Exception:
+        return str(v).strip()
+
+def settings_for_institutional_ledger(ticker):
+    p = params_for_ticker(ticker)
+    source = param_source_for_ticker(ticker)
+    model_version = (
+        f"{str(ticker).upper()}|Institutional Trend Rail|"
+        f"buf{p['buffer_pct']*100:.2f}|conf{int(p['confirm_bars'])}|"
+        f"hold{int(p['min_hold_bars'])}|cool{int(p['cooldown_bars'])}|"
+        f"fg{p['fast_gain']:.3f}|sg{p['slow_gain']:.3f}|rail{p['rail_mult']:.2f}|"
+        f"slope{int(bool(p['slope_confirm']))}|atr{int(bool(p['atr_safety']))}|rf{int(bool(USE_RISK_FIREWALL))}"
+    )
+    return {
+        "ticker": str(ticker).upper(),
+        **p,
+        "risk_firewall": USE_RISK_FIREWALL,
+        "trend_name": "Institutional Trend Rail",
+        "source": source,
+        "model_version": model_version,
+        "saved_ct": fmt_ct_now(),
+    }
+
+def trade_row_to_institutional_record(ticker, tr, settings, latest_price=None, baseline=True):
+    ticker = str(ticker).upper()
+    status_txt = str(tr.get("Status", "")).strip()
+    is_open_row = status_txt.upper() == "OPEN"
+    entry_dt = tr.get("Entry Date", tr.get("Entry CT", tr.get("Entry", "")))
+    exit_dt = tr.get("Exit Date", tr.get("Exit CT", tr.get("Exit", "")))
+    entry_ct = _safe_str_dt(entry_dt)
+    exit_ct = "Open" if is_open_row else _safe_str_dt(exit_dt)
+    entry_px = _safe_float_or_none(tr.get("Buy Price", tr.get("Entry Price", None)))
+    exit_px = _safe_float_or_none(tr.get("Sell Price", tr.get("Exit/Current Price", tr.get("Exit Price", None))))
+    if is_open_row and latest_price is not None:
+        exit_px = float(latest_price)
+    pnl = _safe_float_or_none(tr.get("PnL (%)", tr.get("Return (%)", None)))
+    if pnl is None and entry_px and exit_px:
+        pnl = (float(exit_px) / float(entry_px) - 1.0) * 100.0
+    return {
+        "Ticker": ticker,
+        "Side": "Long",
+        "Entry CT": entry_ct,
+        "Exit CT": exit_ct,
+        "Entry Price": round(entry_px, 4) if entry_px is not None else None,
+        "Exit/Current Price": round(exit_px, 4) if exit_px is not None else None,
+        "PnL (%)": round(pnl, 4) if pnl is not None else None,
+        "Status": "Open" if is_open_row else "Closed",
+        "Locked Buffer %": round(float(settings.get("buffer_pct", 0.0)) * 100.0, 4),
+        "Locked Confirm": int(settings.get("confirm_bars", 0)),
+        "Locked Min Hold": int(settings.get("min_hold_bars", 0)),
+        "Locked Cooldown": int(settings.get("cooldown_bars", 0)),
+        "Model Version": settings.get("model_version", ""),
+        "Settings Source": settings.get("source", ""),
+        "Ledger Mode": "Baseline" if baseline else "Live Append",
+    }
+
+def apply_institutional_trade_ledger(ticker, candidate_trades, px, settings):
+    if not USE_INSTITUTIONAL_LEDGER:
+        return candidate_trades
+
+    ticker = str(ticker).upper()
+    latest_price = float(pd.Series(px).dropna().iloc[-1])
+    latest_time = _safe_str_dt(pd.Series(px).dropna().index[-1])
+
+    ledger = load_institutional_ledger()
+    book = ledger.get(ticker, {"trades": [], "last_update_ct": ""})
+    rows = book.get("trades", []) if isinstance(book, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    cand = candidate_trades.copy() if isinstance(candidate_trades, pd.DataFrame) else pd.DataFrame()
+
+    if len(rows) == 0 and not cand.empty:
+        rows = [
+            trade_row_to_institutional_record(ticker, tr, settings, latest_price=latest_price, baseline=True)
+            for _, tr in cand.iterrows()
+        ]
+    else:
+        open_i = None
+        for i, r in enumerate(rows):
+            if str(r.get("Status", "")).lower() == "open":
+                open_i = i
+                break
+
+        if open_i is not None:
+            open_row = rows[open_i]
+            open_entry = str(open_row.get("Entry CT", ""))
+            matched_closed = None
+            if not cand.empty:
+                for _, tr in cand.iterrows():
+                    rec = trade_row_to_institutional_record(ticker, tr, settings, latest_price=latest_price, baseline=False)
+                    if str(rec.get("Entry CT", "")) == open_entry and str(rec.get("Status", "")).lower() == "closed":
+                        matched_closed = rec
+                        break
+            if matched_closed is not None:
+                for k in ["Exit CT", "Exit/Current Price", "PnL (%)", "Status"]:
+                    open_row[k] = matched_closed.get(k)
+                open_row["Ledger Mode"] = "Live Closed"
+                rows[open_i] = open_row
+            else:
+                ep = _safe_float_or_none(open_row.get("Entry Price"))
+                open_row["Exit CT"] = "Open"
+                open_row["Exit/Current Price"] = round(latest_price, 4)
+                if ep:
+                    open_row["PnL (%)"] = round((latest_price / ep - 1.0) * 100.0, 4)
+                open_row["Status"] = "Open"
+                open_row["Ledger Mode"] = "Live Open"
+                rows[open_i] = open_row
+
+        has_open = any(str(r.get("Status", "")).lower() == "open" for r in rows)
+        if not has_open and not cand.empty:
+            existing_entries = {str(r.get("Entry CT", "")) for r in rows}
+            for _, tr in cand.iterrows():
+                rec = trade_row_to_institutional_record(ticker, tr, settings, latest_price=latest_price, baseline=False)
+                ent = str(rec.get("Entry CT", ""))
+                if ent and ent not in existing_entries:
+                    rows.append(rec)
+                    existing_entries.add(ent)
+
+    ledger[ticker] = {
+        "ticker": ticker,
+        "trades": rows,
+        "last_update_ct": fmt_ct_now(),
+        "latest_price": latest_price,
+        "latest_time": latest_time,
+        "current_settings_seen": settings,
+    }
+    save_institutional_ledger(ledger)
+    return pd.DataFrame(rows)
 
 def _trade_row_is_open(last_row, columns=None):
     try:
@@ -843,6 +1041,7 @@ def latest_kalman_state(ticker):
         "last_trade": last_trade,
     }
 
+
 def debug_ticker(ticker):
     t = str(ticker or "").strip().upper()
     if t not in WATCHLIST:
@@ -862,13 +1061,14 @@ def debug_ticker(ticker):
             f"Price: <b>{info['price']:.2f}</b> | Rail: <b>{info['rail']:.2f}</b>\n"
             f"Latest completed candle CT: <b>{info['candle_close_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
             f"Last trade status: <b>{last_trade.get('Status', 'None')}</b> | Entry: <b>{last_trade.get('Entry Date', '')}</b>\n"
-            "Institutional ledger import: <b>OFF</b>"
+            "Institutional ledger import: <b>OFF</b> (prevents daily/15m mixing)"
         )
     except Exception as e:
         return f"⚠️ {t} debug error: {e}"
 
+
 # ============================================================
-# BOT COMMAND CONTROLLER
+# TELEGRAM COMMANDS
 # ============================================================
 def _load_update_offset():
     global last_update_id
@@ -877,19 +1077,19 @@ def _load_update_offset():
         last_update_id = data["last_update_id"]
 
 def _save_update_offset():
-    with state_lock:
-        _save_json_file(UPDATE_OFFSET_FILE, {"last_update_id": last_update_id})
+    _save_json_file(UPDATE_OFFSET_FILE, {"last_update_id": last_update_id})
 
 def handle_telegram_commands():
     global last_update_id, rescan_requested
     if not BOT_TOKEN:
         return
     try:
-        params = {"timeout": 1}  # Short polling timeout for snappy multi-threaded execution
+        params = {"timeout": 0}
         if last_update_id is not None:
             params["offset"] = str(last_update_id)
-        resp = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params=params, timeout=5).json()
+        resp = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params=params, timeout=8).json()
         if not resp.get("ok", True):
+            print(f"Telegram getUpdates not ok: {resp}")
             return
         for res in resp.get("result", []):
             last_update_id = int(res["update_id"]) + 1
@@ -908,10 +1108,11 @@ def handle_telegram_commands():
                 unknown = sorted([t for t, s in positions.items() if s not in ("LONG", "CASH")])
                 msg = (
                     f"📋 <b>Main Kalman Source-of-Truth v18 — {fmt_ct_now()}</b>\n"
-                    f"Interval: <b>{INTERVAL}</b> | Lookback: <b>{LOOKBACK_DAYS} days</b>\n"
-                    f"Full scans: <b>{full_scans_completed}</b> | Params: <b>{len(BUNDLE_PARAMS)}</b>\n"
-                    f"Scan Processing State: <b>{'COMPILING...' if scan_in_progress else 'IDLE'}</b>\n"
-                    f"{len(longs)} LONG / {len(cash)} CASH\n\n"
+                    f"Interval: <b>{INTERVAL}</b> | Visible-tab lookback: <b>{LOOKBACK_DAYS} days</b>\n"
+                    f"Full scans: <b>{full_scans_completed}</b> | Params loaded: <b>{len(BUNDLE_PARAMS)}</b>\n"
+                    f"Bundle: <b>{'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}</b> | "
+                    f"15m signal-lock keys: <b>{len(load_signal_lock())}</b> | Institutional ledger: <b>OFF</b>\n"
+                    f"{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN\n\n"
                     + "<b>LONG</b>\n" + ("".join([f"🟢 {t}\n" for t in longs]) if longs else "None\n")
                     + "\n<b>CASH</b>\n" + ("".join([f"⚪ {t}\n" for t in cash]) if cash else "None\n")
                 )
@@ -925,10 +1126,14 @@ def handle_telegram_commands():
             elif cmd == "/stateinfo":
                 send_telegram(
                     f"<b>Streamlit state loaded</b>\n"
+                    f"Bundle found: {os.path.exists(BUNDLE_FILE)}\n"
                     f"Bundle version: {STREAMLIT_BUNDLE.get('bundle_version', 0)}\n"
+                    f"Bundle exported CT: {STREAMLIT_BUNDLE.get('exported_ct','')}\n"
                     f"Per-ticker params: {len(BUNDLE_PARAMS)}\n"
+                    f"Bundle open tickers: {len(STREAMLIT_BUNDLE.get('streamlit_open_tickers', []))}\n"
                     f"Signal-lock keys: {len(load_signal_lock())}\n"
-                    f"Data path: {LOOKBACK_DAYS}d / {INTERVAL}"
+                    f"Institutional ledger imported: 0 (disabled in v18)\n"
+                    f"Data path: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False / prepost=False"
                 )
 
             elif cmd == "/params":
@@ -936,11 +1141,22 @@ def handle_telegram_commands():
                 counts = summary.get("source_counts", {}) if isinstance(summary, dict) else {}
                 lines = [
                     "<b>v18 Parameter Sources</b>",
+                    f"Bundle version: {STREAMLIT_BUNDLE.get('bundle_version', 0)}",
+                    f"Bundle records present: {len(BUNDLE_PARAMS)}/150",
                     f"Trusted live Streamlit records: {len(TRUSTED_BUNDLE_PARAMS)}",
+                    f"Stale batch records ignored: {len([1 for r in BUNDLE_PARAMS.values() if isinstance(r, dict) and (str(r.get('_sync_source','')) == 'BATCH_SEED_FALLBACK' or str(r.get('source','')) == 'BATCH_SAME_MAIN_KALMAN_OPTIMIZER_60D_15M')])}",
                     f"Exact Streamlit optimizer cache: {len(EXACT_PARAMS_CACHE)}",
+                    f"Current states: {len([1 for s in positions.values() if s in ('LONG','CASH')])}/150 baselined",
+                    "Institutional ledger import: OFF",
                 ]
                 if MISSING_PARAM_TICKERS:
                     lines.append("Missing params: " + ", ".join(MISSING_PARAM_TICKERS))
+                if EXTRA_PARAM_TICKERS:
+                    lines.append("Extra params: " + ", ".join(EXTRA_PARAM_TICKERS))
+                if isinstance(counts, dict) and counts:
+                    lines.append("Sources:")
+                    for k, v in sorted(counts.items()):
+                        lines.append(f"- {k}: {v}")
                 send_telegram("\n".join(lines))
 
             elif cmd == "/rescan":
@@ -954,16 +1170,6 @@ def handle_telegram_commands():
                 send_telegram("/status\n/why AMD\n/stateinfo\n/params\n/rescan\n/ping")
     except Exception as e:
         print(f"Telegram command error: {e}")
-
-# ============================================================
-# ASYNC WORKER THREAD FOR TELEGRAM ENGINE
-# ============================================================
-def telegram_worker_loop():
-    """Independent background polling engine executing queries in real-time."""
-    print("🤖 Telegram async listener thread spawned and active.")
-    while True:
-        handle_telegram_commands()
-        time.sleep(0.25)  # 250ms polling loop frequency for immediate interaction turnaround
 
 def next_quarter_scan_time(now=None):
     now = now or ct_now()
@@ -980,20 +1186,22 @@ def next_quarter_scan_time(now=None):
 def sleep_until_scan_time(target_dt):
     global rescan_requested
     while True:
+        handle_telegram_commands()
         if rescan_requested:
             return "manual"
         remaining = (target_dt - ct_now()).total_seconds()
         if remaining <= 0:
             return "scheduled"
-        time.sleep(0.5)
+        time.sleep(min(2.0, remaining))
 
 # ============================================================
-# SCANNER OPERATION
+# SCAN
 # ============================================================
 def scan_once():
     global scan_started_at, scan_finished_at, scan_in_progress, full_scans_completed
     scan_in_progress = True
     scan_started_at = fmt_ct_now()
+    handle_telegram_commands()
     baseline_mode = (full_scans_completed == 0)
 
     for ticker in WATCHLIST:
@@ -1003,11 +1211,13 @@ def scan_once():
                 positions[ticker] = "UNKNOWN"
                 last_error[ticker] = "not enough data"
                 last_checked[ticker] = fmt_ct_now()
+                print(f"⚠️ {ticker}: no data")
                 time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
                 continue
 
             old_state = positions.get(ticker, "UNKNOWN")
             new_state = info["position"]
+            raw_alert = info["raw_alert"]
             positions[ticker] = new_state
             last_checked[ticker] = info["candle_close_ct"].strftime("%Y-%m-%d %I:%M %p CT")
             last_error.pop(ticker, None)
@@ -1025,8 +1235,18 @@ def scan_once():
                 emoji = "🟢" if transition == "BUY" else "🔴"
                 send_telegram(
                     f"{emoji} <b>PINEHURST MAIN KALMAN {transition}</b>\n"
-                    f"Ticker: <b>{ticker}</b> | Price: <b>{info['price']:.2f}</b>\n"
-                    f"Bar Time CT: <b>{info['bar_start_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>"
+                    f"Ticker: <b>{ticker}</b>\n"
+                    f"Position: <b>{new_state}</b>\n"
+                    f"Price: <b>{info['price']:.2f}</b>\n"
+                    f"Rail: <b>{info['rail']:.2f}</b>\n"
+                    f"Bar Time CT: <b>{info['bar_start_ct'].strftime('%Y-%m-%d %I:%M %p CT')}</b>\n"
+                    f"Source: Streamlit Source-of-Truth v18"
+                )
+                print(f"📊 {ticker}: {old_state} -> {new_state} | {transition}")
+            else:
+                print(
+                    f"{ticker}: {new_state} | raw={info['raw_signal_position']} | "
+                    f"price={info['price']:.2f} | previous={old_state} | latest_raw_alert={raw_alert}"
                 )
 
             save_state()
@@ -1035,6 +1255,7 @@ def scan_once():
             positions[ticker] = "UNKNOWN"
             last_error[ticker] = str(e)[:160]
             last_checked[ticker] = fmt_ct_now()
+            print(f"{ticker} scan error: {e}")
             time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
 
     scan_in_progress = False
@@ -1048,31 +1269,49 @@ def scan_once():
         unknown = sorted([t for t, s in positions.items() if s == "UNKNOWN"])
         send_telegram(
             f"✅ <b>v18 exact 15m baseline complete</b>\n"
-            f"150-ticker scan: <b>{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN</b>"
+            f"150-ticker scan: <b>{len(longs)} LONG / {len(cash)} CASH / {len(unknown)} UNKNOWN</b>\n"
+            f"Trusted Streamlit params: <b>{len(TRUSTED_BUNDLE_PARAMS)}</b>\n"
+            f"Exact optimizer cache: <b>{len(EXACT_PARAMS_CACHE)}</b>\n"
+            "No BUY/SELL alerts were sent during baseline."
         )
 
 if __name__ == "__main__":
     seed_streamlit_state_once()
     load_state()
+    # v18 positions stay UNKNOWN until the first exact 150-ticker baseline scan.
     _load_update_offset()
 
-    # Launch background Telegram controller thread immediately
-    bot_thread = threading.Thread(target=telegram_worker_loop, daemon=True)
-    bot_thread.start()
+    print("🚀 Pinehurst Main Kalman Source-of-Truth v18")
+    print(f"Data path: {LOOKBACK_DAYS} calendar days / {INTERVAL} / auto_adjust=False")
+    print(f"Bundle params loaded: {len(BUNDLE_PARAMS)}")
+    print(f"Bundle found: {os.path.exists(BUNDLE_FILE)}")
+    print(f"Bundle records present: {len(WATCHLIST) - len(MISSING_PARAM_TICKERS)}/{len(WATCHLIST)}")
+    print(f"Trusted live Streamlit params: {len(TRUSTED_BUNDLE_PARAMS)}")
+    print(f"Exact optimizer cache: {len(EXACT_PARAMS_CACHE)}")
+    if MISSING_PARAM_TICKERS:
+        print("MISSING PARAM TICKERS: " + ", ".join(MISSING_PARAM_TICKERS))
+    if EXTRA_PARAM_TICKERS:
+        print("EXTRA PARAM TICKERS: " + ", ".join(EXTRA_PARAM_TICKERS))
+    print(f"Signal-lock keys: {len(load_signal_lock())}")
+    print("Institutional ledger import: OFF (daily/15m contamination blocked)")
+    print(f"Scan schedule: every {SCAN_EVERY_MINUTES}m + {SCAN_DELAY_SECONDS}s CT")
 
-    print("🚀 Pinehurst Main Kalman Source-of-Truth v18 Engine Running")
     next_scheduled_scan_ct = next_quarter_scan_time()
     send_telegram(
         f"🚀 <b>Pinehurst Main Kalman Source-of-Truth v18 active</b>\n"
-        f"Background UI Threading: <b>ONLINE (Instant Status Enabled)</b>\n"
+        f"Data: {LOOKBACK_DAYS}d / {INTERVAL} / auto_adjust=False\n"
+        f"Trusted params: {len(TRUSTED_BUNDLE_PARAMS)} | Exact cache: {len(EXACT_PARAMS_CACHE)} | Bundle: {'LOADED' if os.path.exists(BUNDLE_FILE) else 'NOT FOUND'}\n"
         f"Next scan: <b>{fmt_ct_dt(next_scheduled_scan_ct)}</b>"
     )
 
     while True:
         next_scheduled_scan_ct = next_quarter_scan_time()
+        print(f"⏳ Waiting until {fmt_ct_dt(next_scheduled_scan_ct)}")
         reason = sleep_until_scan_time(next_scheduled_scan_ct)
         if reason == "manual":
             rescan_requested = False
-            print("🔄 Manual rescan triggered via async signal.")
+            print("🔄 Manual rescan")
         scan_once()
         save_state()
+        handle_telegram_commands()
+        print("✅ Full scan complete.")

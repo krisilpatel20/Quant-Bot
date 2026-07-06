@@ -428,9 +428,9 @@ def handle_telegram_commands():
 # ============================================================
 # DATA
 # ============================================================
-def fetch_completed_bars(ticker: str):
+def _clean_price_series(df, ticker: str):
+    """Shared post-processing: pick Close column, tz-convert to CT, drop forming candle."""
     try:
-        df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True, prepost=False, threads=False)
         if df is None or df.empty:
             return None
 
@@ -464,8 +464,71 @@ def fetch_completed_bars(ticker: str):
 
         return px.dropna()
     except Exception as e:
+        print(f"{ticker} data clean error: {e}")
+        return None
+
+
+def fetch_completed_bars(ticker: str):
+    """Single-ticker fetch — used only for on-demand /why and /debug commands.
+    The main scan loop uses fetch_all_completed_bars() instead (see below)."""
+    try:
+        df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True, prepost=False, threads=False)
+        return _clean_price_series(df, ticker)
+    except Exception as e:
         print(f"{ticker} data error: {e}")
         return None
+
+
+def fetch_all_completed_bars(tickers):
+    """
+    SPEED FIX: download the entire watchlist in ONE yfinance call (threads=True lets
+    yfinance fetch all tickers in parallel under the hood) instead of looping and
+    making ~140 separate blocking network requests with a sleep between each.
+    This is the change that takes scans from minutes down to seconds/tens-of-seconds.
+    Returns: {ticker: pd.Series of cleaned close prices} — only for tickers with enough data.
+    """
+    out = {}
+    if not tickers:
+        return out
+    try:
+        raw = yf.download(
+            tickers=list(tickers),
+            period=PERIOD,
+            interval=INTERVAL,
+            group_by="ticker",
+            auto_adjust=True,
+            prepost=False,
+            threads=True,
+            progress=False,
+        )
+    except Exception as e:
+        print(f"Batch download error: {e}")
+        return out
+
+    if raw is None or raw.empty:
+        return out
+
+    for ticker in tickers:
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                top_level = raw.columns.get_level_values(0)
+                if ticker not in top_level:
+                    continue
+                df_t = raw[ticker]
+            else:
+                # Only happens if a single ticker was requested — whole frame is that ticker's data.
+                df_t = raw if len(tickers) == 1 else None
+                if df_t is None:
+                    continue
+
+            px = _clean_price_series(df_t, ticker)
+            if px is not None:
+                out[ticker] = px
+        except Exception as e:
+            print(f"{ticker} batch parse error: {e}")
+            continue
+
+    return out
 
 # ============================================================
 # STREAMLIT MAIN KALMAN LOGIC — COPIED/PORTED WITHOUT STREAMLIT
@@ -739,8 +802,9 @@ def run_streamlit_trade_log_status(px: pd.Series, sig: pd.Series, initial_capita
         return "LONG", last_trade
     return "CASH", last_trade
 
-def latest_kalman_state(ticker: str):
-    px = fetch_completed_bars(ticker)
+def latest_kalman_state(ticker: str, px=None):
+    if px is None:
+        px = fetch_completed_bars(ticker)
     if px is None or len(px) < 80:
         return None
 
@@ -834,15 +898,29 @@ def scan_once():
     scan_in_progress = True
     scan_started_at = fmt_ct_now()
 
+    # SPEED FIX: one batched/parallel network fetch for the whole watchlist,
+    # instead of ~140 sequential yf.download calls with a sleep between each.
+    t0 = time.time()
+    print(f"⬇️ Batch-fetching {len(WATCHLIST)} tickers...")
+    price_data = fetch_all_completed_bars(WATCHLIST)
+    print(f"⬇️ Batch fetch done in {time.time() - t0:.1f}s — {len(price_data)}/{len(WATCHLIST)} tickers returned data")
+
     for ticker in WATCHLIST:
         try:
-            info = latest_kalman_state(ticker)
+            px = price_data.get(ticker)
+            if px is None:
+                positions[ticker] = "UNKNOWN"
+                last_error[ticker] = "not enough data / no yfinance data"
+                last_checked[ticker] = fmt_ct_now()
+                print(f"⚠️ {ticker}: not enough data")
+                continue
+
+            info = latest_kalman_state(ticker, px=px)
             if info is None:
                 positions[ticker] = "UNKNOWN"
                 last_error[ticker] = "not enough data / no yfinance data"
                 last_checked[ticker] = fmt_ct_now()
                 print(f"⚠️ {ticker}: not enough data")
-                time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
                 continue
 
             old_state = positions.get(ticker, "UNKNOWN")
@@ -883,17 +961,14 @@ def scan_once():
                 )
                 send_telegram(msg)
                 print(f"📊 {ticker}: {old_state} -> {new_state} | {transition_alert} | {info['price']:.2f}")
+                save_state()  # persist immediately on real BUY/SELL alerts
             else:
                 print(f"{ticker}: {new_state} | {info['price']:.2f} | previous={old_state} latest_bar_alert={raw_alert}")
-
-            save_state()
-            time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
         except Exception as e:
             positions[ticker] = "UNKNOWN"
             last_error[ticker] = str(e)[:120]
             last_checked[ticker] = fmt_ct_now()
             print(f"{ticker} scan error: {e}")
-            time.sleep(SLEEP_BETWEEN_TICKERS_SEC)
 
     scan_in_progress = False
     scan_finished_at = fmt_ct_now()

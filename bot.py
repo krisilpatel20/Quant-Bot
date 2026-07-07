@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import json
 import threading
@@ -479,20 +480,12 @@ def fetch_completed_bars(ticker: str):
         return None
 
 
-def fetch_all_completed_bars(tickers):
-    """
-    SPEED FIX: download the entire watchlist in ONE yfinance call (threads=True lets
-    yfinance fetch all tickers in parallel under the hood) instead of looping and
-    making ~140 separate blocking network requests with a sleep between each.
-    This is the change that takes scans from minutes down to seconds/tens-of-seconds.
-    Returns: {ticker: pd.Series of cleaned close prices} — only for tickers with enough data.
-    """
+def _fetch_chunk(tickers_chunk):
+    """Download+clean one small chunk of tickers, return {ticker: px}. Frees memory after each chunk."""
     out = {}
-    if not tickers:
-        return out
     try:
         raw = yf.download(
-            tickers=list(tickers),
+            tickers=list(tickers_chunk),
             period=PERIOD,
             interval=INTERVAL,
             group_by="ticker",
@@ -502,13 +495,13 @@ def fetch_all_completed_bars(tickers):
             progress=False,
         )
     except Exception as e:
-        print(f"Batch download error: {e}")
+        print(f"Chunk download error: {e}")
         return out
 
     if raw is None or raw.empty:
         return out
 
-    for ticker in tickers:
+    for ticker in tickers_chunk:
         try:
             if isinstance(raw.columns, pd.MultiIndex):
                 top_level = raw.columns.get_level_values(0)
@@ -516,8 +509,7 @@ def fetch_all_completed_bars(tickers):
                     continue
                 df_t = raw[ticker]
             else:
-                # Only happens if a single ticker was requested — whole frame is that ticker's data.
-                df_t = raw if len(tickers) == 1 else None
+                df_t = raw if len(tickers_chunk) == 1 else None
                 if df_t is None:
                     continue
 
@@ -527,6 +519,36 @@ def fetch_all_completed_bars(tickers):
         except Exception as e:
             print(f"{ticker} batch parse error: {e}")
             continue
+
+    del raw
+    return out
+
+
+# MEMORY FIX: fetching all ~140 tickers in one giant yf.download() call was causing
+# the worker to exceed Render's 512MB limit (OOM kill). Fetching in small chunks keeps
+# only a fraction of the watchlist's OHLCV data in memory at any moment, while still
+# getting most of the parallel-fetch speed benefit within each chunk.
+BATCH_CHUNK_SIZE = int(os.environ.get("BATCH_CHUNK_SIZE", "20"))
+
+
+def fetch_all_completed_bars(tickers):
+    """
+    SPEED FIX: download the watchlist in small parallel-fetched chunks (instead of
+    ~140 fully sequential one-ticker-at-a-time calls with a sleep between each), while
+    keeping peak memory low by processing/discarding one chunk before starting the next.
+    Returns: {ticker: pd.Series of cleaned close prices} — only for tickers with enough data.
+    """
+    out = {}
+    tickers = list(tickers)
+    if not tickers:
+        return out
+
+    for i in range(0, len(tickers), BATCH_CHUNK_SIZE):
+        chunk = tickers[i:i + BATCH_CHUNK_SIZE]
+        chunk_result = _fetch_chunk(chunk)
+        out.update(chunk_result)
+        del chunk_result
+        gc.collect()
 
     return out
 
